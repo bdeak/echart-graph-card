@@ -1,0 +1,17 @@
+# Hourly water consumption for the last two days. Home Assistant's long-term statistics
+# already know how much was used per hour (statistic: change on a total_increasing meter),
+# drawn as a filled step line so every hour reads like a bar.
+type: custom:echart-graph-card
+title: Water usage
+span: 48h
+data_source: statistics
+statistics_period: hour
+series:
+  - entity: sensor.water_meter_total
+    name: Water per hour
+    statistic: change
+    color: "#06B6D4"
+    line: { step: true }
+    fill: solid
+    precision: 0
+    show_in_header: false    # the entity state is the meter reading, not the hourly usage

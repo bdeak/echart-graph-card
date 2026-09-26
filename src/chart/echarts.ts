@@ -3,9 +3,9 @@
  * Import `echarts` from here (never from 'echarts' directly) so the bundle stays small.
  *
  * Registered: LineChart, Grid (value/time axes), Tooltip (+ AxisPointer), Legend (plain +
- * scroll), DataZoom *inside* only (no slider), MarkLine, MarkArea, VisualMap *piecewise* only
- * (use piecewise pieces for color_thresholds), CanvasRenderer.
- * Deliberately NOT registered (bundle cost): DataZoom slider, continuous VisualMap, MarkPoint,
+ * scroll), DataZoom *inside* only (no slider), MarkLine, MarkArea, MarkPoint (show.extrema),
+ * VisualMap *piecewise* only (use piecewise pieces for color_thresholds), CanvasRenderer.
+ * Deliberately NOT registered (bundle cost): DataZoom slider, continuous VisualMap,
  * SVG renderer, Dataset, Title, Toolbox. Using an option for an unregistered component is
  * silently ignored by ECharts, so extend `use([...])` here if one is ever needed.
  *
@@ -22,6 +22,7 @@ import {
   LegendComponent,
   MarkAreaComponent,
   MarkLineComponent,
+  MarkPointComponent,
   TooltipComponent,
   VisualMapPiecewiseComponent,
 } from 'echarts/components';
@@ -31,6 +32,7 @@ import type {
   LegendComponentOption,
   MarkAreaComponentOption,
   MarkLineComponentOption,
+  MarkPointComponentOption,
   TooltipComponentOption,
   VisualMapComponentOption,
 } from 'echarts/components';
@@ -44,6 +46,7 @@ use([
   DataZoomInsideComponent,
   MarkLineComponent,
   MarkAreaComponent,
+  MarkPointComponent,
   VisualMapPiecewiseComponent,
   CanvasRenderer,
 ]);
@@ -57,6 +60,7 @@ export type ECOption = ComposeOption<
   | DataZoomComponentOption
   | MarkLineComponentOption
   | MarkAreaComponentOption
+  | MarkPointComponentOption
   | VisualMapComponentOption
 >;
 

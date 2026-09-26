@@ -1,4 +1,5 @@
 import { DEFAULT_PALETTE } from './chart/theme';
+import { BINARY_DOMAINS } from './data/history';
 import type {
   AxisPosition,
   CardConfig,
@@ -154,6 +155,11 @@ function optString(v: unknown, path: string): string | undefined {
   return t === '' ? undefined : t;
 }
 
+/** Like optString, but YAML numbers (`name: 2024`) are accepted and stringified. */
+function optText(v: unknown, path: string): string | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : optString(v, path);
+}
+
 function optBool(v: unknown, path: string): boolean | undefined {
   if (v === undefined || v === null) return undefined;
   if (typeof v !== 'boolean') fail(path, `must be true or false (got ${JSON.stringify(v)})`);
@@ -255,8 +261,8 @@ function normalizeYAxes(v: unknown): NormalizedYAxis[] {
     const defaultPosition: AxisPosition = i % 2 === 0 ? 'left' : 'right';
     return {
       id,
-      unit: optString(a.unit, `${path}.unit`),
-      name: optString(a.name, `${path}.name`),
+      unit: optText(a.unit, `${path}.unit`),
+      name: optText(a.name, `${path}.name`),
       min,
       max,
       softMin: optNumber(a.soft_min, `${path}.soft_min`),
@@ -302,7 +308,7 @@ function normalizeThresholds(v: unknown, axes: NormalizedYAxis[]): NormalizedThr
       opacity:
         optNumber(t.opacity, `${path}.opacity`, { min: 0, max: 1 }) ??
         (kind === 'area' ? DEFAULTS.thresholdAreaOpacity : DEFAULTS.thresholdLineOpacity),
-      label: optString(t.label, `${path}.label`),
+      label: optText(t.label, `${path}.label`),
       yAxis: checkAxisRef(optString(t.y_axis, `${path}.y_axis`), axes, `${path}.y_axis`),
     };
   });
@@ -321,16 +327,24 @@ function normalizeSeries(
     if (entity === undefined) fail(`${path}.entity`, 'is required (e.g. sensor.living_room_temperature)');
     if (!ENTITY_ID_RE.test(entity)) fail(`${path}.entity`, `"${entity}" is not a valid entity id`);
     const attribute = optString(s.attribute, `${path}.attribute`);
-    const unit = optString(s.unit, `${path}.unit`);
+    const unit = optText(s.unit, `${path}.unit`);
 
     let yAxis = checkAxisRef(optString(s.y_axis, `${path}.y_axis`), axes, `${path}.y_axis`);
     if (yAxis === null && unit !== undefined) yAxis = axes.find((a) => a.unit === unit)?.id ?? null;
 
     const line = normalizeLine(s.line, `${path}.line`);
     const rawLine = isObj(s.line) ? s.line : {};
-    if (rawLine.width === undefined && entity.startsWith('binary_sensor.')) line.width = DEFAULTS.binaryLineWidth;
+    if (!attribute && BINARY_DOMAINS.includes(entity.split('.')[0])) {
+      // on/off entities: thinner, straight (they render as step lines).
+      if (rawLine.width === undefined || rawLine.width === null) line.width = DEFAULTS.binaryLineWidth;
+      if (rawLine.smooth === undefined || rawLine.smooth === null) line.smooth = 0;
+    }
 
-    const fill = optEnum(s.fill, FILL_MODES, `${path}.fill`) ?? (count <= DEFAULTS.autoFillMaxSeries ? 'gradient' : 'none');
+    const colorThresholds = normalizeColorThresholds(s.color_thresholds, `${path}.color_thresholds`);
+    // Value-coloured lines (>= 2 stops) default to no fill: an area would inherit the stops as
+    // horizontal colour bands, which reads like threshold bands and muddies the chart.
+    const autoFill = count <= DEFAULTS.autoFillMaxSeries && colorThresholds.length < 2;
+    const fill = optEnum(s.fill, FILL_MODES, `${path}.fill`) ?? (autoFill ? 'gradient' : 'none');
     const fillOpacity =
       optNumber(s.fill_opacity, `${path}.fill_opacity`, { min: 0, max: 1 }) ??
       (fill === 'solid' ? DEFAULTS.solidOpacity : fill === 'gradient' ? DEFAULTS.gradientOpacity : 0);
@@ -345,7 +359,7 @@ function normalizeSeries(
       key: `${index}:${entity}${attribute ? `#${attribute}` : ''}`,
       entity,
       attribute,
-      name: optString(s.name, `${path}.name`),
+      name: optText(s.name, `${path}.name`),
       color: optString(s.color, `${path}.color`) ?? DEFAULT_PALETTE[index % DEFAULT_PALETTE.length],
       unit,
       yAxis,
@@ -357,7 +371,7 @@ function normalizeSeries(
         multiply: optNumber(tr.multiply, `${path}.transform.multiply`) ?? 1,
         offset: optNumber(tr.offset, `${path}.transform.offset`) ?? 0,
       },
-      colorThresholds: normalizeColorThresholds(s.color_thresholds, `${path}.color_thresholds`),
+      colorThresholds,
       statistic: optEnum(s.statistic, STATISTIC_TYPES, `${path}.statistic`) ?? 'auto',
       precision: optNumber(s.precision, `${path}.precision`, { min: 0, max: 10 }),
       showInHeader: optBool(s.show_in_header, `${path}.show_in_header`) ?? true,
@@ -418,10 +432,15 @@ function defaultStatisticsPeriod(spanMs: number): StatisticsPeriod {
  * Validate the raw YAML config and resolve every default.
  *
  * - `series` (or alias `entities`) must be a non-empty list; bare strings become `{ entity }`.
- * - Window: `span` (bare number = hours) wins over `hours_to_show` (hours); default 24h.
+ * - Window: `span` wins over `hours_to_show`; default 24h. Both accept a number of HOURS or a
+ *   duration string (`"36h"`, `"7d"`). Duration rule everywhere: strings carry their unit;
+ *   bare numbers are hours for `span`/`hours_to_show` and seconds for `group_by`/`update`.
  * - `data_source: auto` -> `history` when spanMs <= 72h, else `statistics` (dataSourceAuto = true).
  * - `statistics_period` default: span <= 2d -> 5minute, <= 31d -> hour, else day.
- * - Colors default to DEFAULT_PALETTE[index]; fill defaults to gradient for <= 2 series, else none.
+ * - Colors default to DEFAULT_PALETTE[index]; fill defaults to gradient for <= 2 series, else none
+ *   (and none for series with >= 2 color_thresholds stops).
+ * - Line: width 2, smooth 0.35, step auto; entities of BINARY_DOMAINS (state series) default to
+ *   width 1.5 and no smoothing.
  * - `series[].y_axis` / `thresholds[].y_axis` must reference `y_axes[].id`; a series without
  *   `y_axis` but with `unit` binds to the configured axis with that unit, otherwise `yAxis: null`
  *   (auto-assigned at render time by unit).
@@ -443,7 +462,7 @@ export function normalizeConfig(raw: CardConfig): NormalizedConfig {
 
   let spanMs: number;
   if (cfg.span !== undefined && cfg.span !== null) spanMs = duration(cfg.span, 'span', HOUR);
-  else if (cfg.hours_to_show !== undefined && cfg.hours_to_show !== null) spanMs = (optNumber(cfg.hours_to_show, 'hours_to_show') ?? 24) * HOUR;
+  else if (cfg.hours_to_show !== undefined && cfg.hours_to_show !== null) spanMs = duration(cfg.hours_to_show, 'hours_to_show', HOUR);
   else spanMs = DEFAULTS.spanMs;
   if (spanMs <= 0) fail(cfg.span !== undefined ? 'span' : 'hours_to_show', 'must be > 0');
   spanMs = Math.round(spanMs);
@@ -457,7 +476,7 @@ export function normalizeConfig(raw: CardConfig): NormalizedConfig {
 
   return {
     type: typeof cfg.type === 'string' ? cfg.type : 'custom:echart-graph-card',
-    title: optString(cfg.title, 'title'),
+    title: optText(cfg.title, 'title'),
     spanMs,
     height: normalizeHeight(cfg.height),
     dataSource,

@@ -108,7 +108,10 @@ export interface ShowConfig {
   header_states?: boolean;
   /** Mouse/touch zoom on the time axis (dataZoom inside; wheel zoom requires Ctrl). Default false. */
   zoom?: boolean;
-  /** Min / max / avg badges for header series over the visible window. Default false. */
+  /**
+   * Min / max / avg badges for header series over the visible window. With `header_states: false`
+   * min / max markers are drawn on the chart instead. Default false.
+   */
   extrema?: boolean;
   /** Draw a symbol at every data point. Default false. */
   points?: boolean;
@@ -175,14 +178,14 @@ export interface SeriesConfig {
   name?: string;
   /** CSS color incl. `var(--x)`. Default: DEFAULT_PALETTE[index]. */
   color?: string;
-  /** Unit override. Default: entity `unit_of_measurement`. */
+  /** Unit override. Default: entity `unit_of_measurement` (not used for `attribute` series: set `unit` there). */
   unit?: string;
   /** Explicit `y_axes[].id`. Default: auto axis by unit. */
   y_axis?: string;
   /** Plot this attribute instead of the state. */
   attribute?: string;
   line?: LineConfig;
-  /** Default: `gradient` when the card has <= 2 series, else `none`. */
+  /** Default: `gradient` when the card has <= 2 series, else `none` (also `none` with >= 2 `color_thresholds`). */
   fill?: FillMode;
   /** 0..1. Default: gradient 0.35, solid 0.2. */
   fill_opacity?: number;
@@ -208,8 +211,8 @@ export interface SeriesConfig {
 export interface CardConfig {
   type: string;
   title?: string;
-  /** Window length in hours. Default 24. Ignored when `span` is given. */
-  hours_to_show?: number;
+  /** Window length: a number of hours, or a duration string (`"36h"`). Default 24. Ignored when `span` is given. */
+  hours_to_show?: number | string;
   /** Window length as a duration (`"7d"`); bare numbers are hours. Takes precedence over `hours_to_show`. */
   span?: DurationInput;
   /** Chart height. Number = px, string = any CSS length. Default `220px`. */
@@ -401,7 +404,8 @@ export interface SeriesData {
   source: 'history' | 'statistics';
   /**
    * Grouped history series only: the transformed, ungrouped points of the last (open) bucket,
-   * so LiveBuffer can re-aggregate that bucket incrementally.
+   * preceded by the last point before it (the value carried into the bucket), so LiveBuffer can
+   * re-aggregate that bucket incrementally.
    */
   rawTail?: Point[];
   /** Non-fatal per-series problem (e.g. unknown entity); shown in the card. */

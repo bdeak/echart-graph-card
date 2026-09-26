@@ -1,5 +1,11 @@
-import { notImplemented } from '../stub';
-import type { HassEntityState, HomeAssistant, Point } from '../types';
+import type {
+  HassEntityState,
+  HistoryDuringPeriodMessage,
+  HistoryResponse,
+  HistoryState,
+  HomeAssistant,
+  Point,
+} from '../types';
 
 /** Options for fetchHistory. */
 export interface HistoryFetchOptions {
@@ -45,16 +51,37 @@ export const BINARY_STATE_MAP: Readonly<Record<string, 0 | 1>> = {
   clear: 0,
 };
 
+/** States that mean "no value" (line gap). */
+const NULL_STATES = new Set(['', 'unknown', 'unavailable', 'none', 'null', 'nan']);
+
+/** Plain decimal / scientific number (rejects hex, `Infinity`, `1_000`, `12abc`, ...). */
+const NUMERIC_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/;
+
 /**
  * Convert an HA state (or attribute value) to a number.
  * - number -> itself if finite, else null
  * - boolean -> 1/0
  * - string: trimmed, lower-cased; `''`/`unknown`/`unavailable`/`none` -> null;
- *   BINARY_STATE_MAP keys -> 0/1; otherwise Number(s) if finite, else null.
- * - anything else -> null
+ *   BINARY_STATE_MAP keys -> 0/1; otherwise a plain decimal number, else null.
+ * - anything else (objects, arrays, undefined) -> null
  */
 export function stateToNumber(s: unknown): number | null {
-  return notImplemented('stateToNumber', s);
+  if (typeof s === 'number') return Number.isFinite(s) ? s : null;
+  if (typeof s === 'boolean') return s ? 1 : 0;
+  if (typeof s !== 'string') return null;
+  const k = s.trim().toLowerCase();
+  if (NULL_STATES.has(k)) return null;
+  const b = BINARY_STATE_MAP[k];
+  if (b !== undefined) return b;
+  if (!NUMERIC_RE.test(k)) return null;
+  const n = Number(k);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** `sensor.x` -> `sensor`; external statistic ids (`source:id`) have no domain -> `''`. */
+function domainOf(entityId: string): string {
+  const dot = entityId.indexOf('.');
+  return dot > 0 && !entityId.slice(0, dot).includes(':') ? entityId.slice(0, dot) : '';
 }
 
 /**
@@ -63,7 +90,46 @@ export function stateToNumber(s: unknown): number | null {
  * Always false for attribute series (caller passes `attribute`).
  */
 export function isBinaryEntity(entityId: string, state?: HassEntityState, attribute?: string): boolean {
-  return notImplemented('isBinaryEntity', entityId, state, attribute);
+  if (attribute) return false;
+  if (BINARY_DOMAINS.includes(domainOf(entityId))) return true;
+  if (state && typeof state.state === 'string') {
+    return BINARY_STATE_MAP[state.state.trim().toLowerCase()] !== undefined;
+  }
+  return false;
+}
+
+/** Epoch seconds (float) -> ms; NaN for missing/invalid. */
+function secToMs(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 1000) : Number.NaN;
+}
+
+/**
+ * Convert the compressed history rows of ONE entity to points (ascending, unique timestamps,
+ * clamped to `startMs`). Exported for tests / reuse.
+ */
+export function historyRowsToPoints(rows: HistoryState[] | undefined, startMs: number, attribute?: string): Point[] {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const pts: Point[] = [];
+  let sorted = true;
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    // State series: last_changed (lc is omitted when equal to lu; minimal rows carry it in lu).
+    // Attribute series: last_updated (attribute changes don't touch last_changed).
+    const raw = attribute ? secToMs(row.lu) : secToMs(row.lc ?? row.lu);
+    if (Number.isNaN(raw)) continue;
+    const t = raw < startMs ? startMs : raw;
+    const v = attribute ? stateToNumber(row.a?.[attribute]) : stateToNumber(row.s);
+    if (pts.length && t < pts[pts.length - 1][0]) sorted = false;
+    pts.push([t, v]);
+  }
+  if (!sorted) pts.sort((a, b) => a[0] - b[0]); // stable: equal timestamps keep response order
+  // Dedupe equal timestamps, keeping the last value.
+  const out: Point[] = [];
+  for (const p of pts) {
+    if (out.length && out[out.length - 1][0] === p[0]) out[out.length - 1] = p;
+    else out.push(p);
+  }
+  return out;
 }
 
 /**
@@ -74,8 +140,10 @@ export function isBinaryEntity(entityId: string, state?: HassEntityState, attrib
  *
  * Returns `entity_id -> Point[]` (ascending, deduped timestamps; every requested id present,
  * `[]` when no rows). Timestamps: seconds -> ms; state series use `lc ?? lu`, attribute series
- * use `lu`; the first point is clamped to `start`. Values via stateToNumber (on the attribute
- * value when `opts.attribute` is set); unavailable/unknown become `null` (line gap).
+ * use `lu`; points before `start` (the state valid at the window start) are clamped to `start`.
+ * Values via stateToNumber (on the attribute value when `opts.attribute` is set);
+ * unavailable/unknown/non-numeric become `null` (line gap). No synthetic trailing point is added
+ * (buildOptions extends history lines to `now`).
  * Rejects if callWS rejects. Empty `entityIds` resolves to `{}` without a call.
  */
 export async function fetchHistory(
@@ -85,5 +153,21 @@ export async function fetchHistory(
   end: Date,
   opts: HistoryFetchOptions = {},
 ): Promise<Record<string, Point[]>> {
-  return notImplemented('fetchHistory', hass, entityIds, start, end, opts);
+  const ids = [...new Set(entityIds)];
+  if (ids.length === 0) return {};
+  const attribute = opts.attribute || undefined;
+  const msg: HistoryDuringPeriodMessage = {
+    type: 'history/history_during_period',
+    start_time: start.toISOString(),
+    end_time: end.toISOString(),
+    entity_ids: ids,
+    minimal_response: !attribute,
+    no_attributes: !attribute,
+    significant_changes_only: false,
+  };
+  const res = await hass.callWS<HistoryResponse | null>(msg);
+  const startMs = start.getTime();
+  const out: Record<string, Point[]> = {};
+  for (const id of ids) out[id] = historyRowsToPoints(res?.[id], startMs, attribute);
+  return out;
 }

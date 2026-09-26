@@ -5,6 +5,12 @@ const entry = fileURLToPath(new URL('./src/index.ts', import.meta.url));
 const outDir = fileURLToPath(new URL('./dist', import.meta.url));
 
 export default defineConfig({
+  // ECharts guards dev-only code with `process.env.NODE_ENV`; Vite library mode does not replace
+  // it, and browsers have no `process` (ReferenceError on first use). Replacing it also drops the
+  // dev-only branches from the bundle.
+  define: {
+    'process.env.NODE_ENV': JSON.stringify('production'),
+  },
   build: {
     lib: {
       entry,
@@ -30,6 +36,6 @@ export default defineConfig({
   },
   test: {
     environment: 'happy-dom',
-    include: ['tests/**/*.test.ts'],
+    include: ['tests/**/*.test.ts', 'dev/**/*.test.ts'],
   },
 });

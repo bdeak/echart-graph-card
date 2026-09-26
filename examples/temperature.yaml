@@ -1,0 +1,19 @@
+# Indoor vs. outdoor temperature over two days, plus the thermostat setpoint.
+# The setpoint is read from a climate entity *attribute* and drawn as a dashed step line.
+# Both temperature sensors report °C, so everything shares one auto-created axis.
+type: custom:echart-graph-card
+title: Temperature
+hours_to_show: 48
+show:
+  extrema: true              # min / max / avg of the visible window in the header
+series:
+  - entity: sensor.living_room_temperature
+    name: Living room
+  - entity: sensor.outdoor_temperature
+    name: Outdoor
+  - entity: climate.living_room
+    attribute: temperature   # plot the setpoint, not the state ("heat")
+    name: Setpoint
+    unit: °C                 # climate entities have no unit_of_measurement
+    line: { step: true, style: dashed, width: 1.5 }
+    show_in_header: false

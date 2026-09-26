@@ -1,0 +1,29 @@
+# Two value axes: power in W on the left, battery state of charge in % on the right.
+# Series are matched to the configured axes by unit, so no series needs an explicit y_axis.
+type: custom:echart-graph-card
+title: Solar & battery
+hours_to_show: 24
+group_by: 5m                 # 5-minute averages for every series
+y_axes:
+  - id: power
+    unit: W
+  - id: soc
+    unit: "%"
+    min: 0
+    max: 100
+    position: right
+thresholds:
+  - value: 0
+    y_axis: power
+series:
+  - entity: sensor.growatt_min_3000_tl_x_growatt_pv_power_total
+    name: Solar
+    color: "#FFC107"
+    fill: gradient
+  - entity: sensor.batteries_total_power
+    name: Battery
+    color: "#4CAF50"
+  - entity: sensor.marstek_venus_modbus_battery_soc
+    name: SoC
+    color: "#8B5CF6"
+    line: { style: dashed, width: 1.5 }

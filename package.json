@@ -15,7 +15,7 @@
     "dev": "vite serve dev --config vite.config.ts",
     "build": "vite build",
     "test": "vitest run",
-    "lint": "eslint src tests",
+    "lint": "eslint src tests dev",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [

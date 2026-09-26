@@ -1,0 +1,29 @@
+# Energy flow over the last two hours: grid, solar and battery power in W.
+# Port of an apexcharts-card config (graph_span 2h, group_by avg 30s, soft y range
+# -3000..5000 W, dashed zero line). Sign convention: grid positive = import,
+# battery positive = discharge / negative = charge.
+type: custom:echart-graph-card
+title: Energy Flow
+span: 2h
+height: 250px
+group_by:                    # applies to every series (a series can override or opt out)
+  func: avg
+  duration: 30s
+y_axes:
+  - id: power
+    unit: W
+    soft_min: -3000          # axis shows at least -3000..5000 W, grows if data exceeds it
+    soft_max: 5000
+thresholds:
+  - value: 0
+    style: dashed
+series:
+  - entity: sensor.grid_measured_total_power
+    name: Grid
+    color: "#2196F3"
+  - entity: sensor.growatt_min_3000_tl_x_growatt_pv_power_total
+    name: Solar
+    color: "#FFC107"
+  - entity: sensor.batteries_total_power
+    name: Battery
+    color: "#4CAF50"

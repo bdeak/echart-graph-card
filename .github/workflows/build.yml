@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      # dist/ is committed (HACS can install from the default branch). Warn when the committed
+      # bundle does not match a fresh build of this commit.
+      - name: Check committed dist/ is up to date
+        run: |
+          if ! git diff --quiet -- dist/; then
+            echo "::warning file=dist/echart-graph-card.js::dist/ is out of date. Run 'npm run build' and commit dist/."
+          fi
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: echart-graph-card
+          path: dist/echart-graph-card.js
+          if-no-files-found: error

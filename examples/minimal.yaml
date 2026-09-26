@@ -1,0 +1,6 @@
+# The smallest useful config: one entity, everything else defaulted.
+# You get a 24 h window, a smooth line with a gradient fill, live updates,
+# and a header chip showing the current value (it doubles as the legend).
+type: custom:echart-graph-card
+series:
+  - entity: sensor.living_room_temperature

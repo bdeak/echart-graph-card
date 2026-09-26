@@ -1,0 +1,21 @@
+# One week of humidity with a comfort band. Windows longer than 72 h switch to
+# Home Assistant's long-term statistics automatically (hourly means here), so even
+# long spans load instantly. soft_min / soft_max keep the band in view on quiet days.
+type: custom:echart-graph-card
+title: Humidity
+span: 7d
+y_axes:
+  - id: humidity
+    unit: "%"
+    soft_min: 30
+    soft_max: 70
+thresholds:
+  - from: 40
+    to: 60
+    color: "#10B981"
+    label: Comfort
+series:
+  - entity: sensor.living_room_humidity
+    name: Living room
+    color: "#06B6D4"
+    precision: 0

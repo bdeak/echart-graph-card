@@ -1,0 +1,9 @@
+# Binary sensors are detected automatically and drawn as 0/1 step lines
+# (open / on = 1). A short card height works well for on/off timelines.
+type: custom:echart-graph-card
+title: Front door
+hours_to_show: 12
+height: 120px
+series:
+  - entity: binary_sensor.front_door
+    name: Front door

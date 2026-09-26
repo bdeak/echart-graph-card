@@ -1,0 +1,44 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching package.json "version") to build the card and attach
+# dist/echart-graph-card.js to a GitHub release. HACS installs that release asset.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Check tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/echart-graph-card.js
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          # v1.2.0-beta.1 and similar are published as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

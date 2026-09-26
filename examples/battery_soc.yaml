@@ -1,0 +1,31 @@
+# State of charge of two home batteries on a fixed 0-100 % axis.
+# The line colour follows the charge level (color_thresholds: red below 20 %,
+# amber below 50 %, green above) and a red band marks the discharge reserve.
+type: custom:echart-graph-card
+title: Battery
+hours_to_show: 24
+y_axes:
+  - id: soc
+    unit: "%"
+    min: 0
+    max: 100
+thresholds:
+  - from: 0
+    to: 10
+    color: "#EF4444"
+    label: Reserve
+series:
+  - entity: sensor.marstek_venus_modbus_battery_soc
+    name: Battery 1
+    color_thresholds:
+      - { value: 0, color: "#EF4444" }
+      - { value: 20, color: "#F59E0B" }
+      - { value: 50, color: "#10B981" }
+  - entity: sensor.marstek_venus_modbus_device_2_battery_soc
+    name: Battery 2
+    line: { style: dashed }
+    fill: none
+    color_thresholds:
+      - { value: 0, color: "#EF4444" }
+      - { value: 20, color: "#F59E0B" }
+      - { value: 50, color: "#10B981" }
