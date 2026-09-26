@@ -38,5 +38,13 @@
     "typescript-eslint": "^8.70.1",
     "vite": "^8.3.1",
     "vitest": "^5.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bdeak/echart-graph-card.git"
+  },
+  "homepage": "https://github.com/bdeak/echart-graph-card#readme",
+  "bugs": {
+    "url": "https://github.com/bdeak/echart-graph-card/issues"
   }
 }

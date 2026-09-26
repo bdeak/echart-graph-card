@@ -52,5 +52,5 @@ First version.
 - Dev harness (`npm run dev`) with a mock `hass` and synthetic data. Example configs live in
   `examples/`. CI builds, a tag-driven release workflow and HACS validation are included.
 
-[Unreleased]: https://github.com/OWNER/echart-graph-card/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/OWNER/echart-graph-card/releases/tag/v0.1.0
+[Unreleased]: https://github.com/bdeak/echart-graph-card/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/bdeak/echart-graph-card/releases/tag/v0.1.0

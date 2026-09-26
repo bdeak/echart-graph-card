@@ -62,8 +62,7 @@ series:
 ### HACS (custom repository)
 
 1. In Home Assistant open **HACS**, then **⋮** (top right), then **Custom repositories**.
-2. Add `https://github.com/OWNER/echart-graph-card` with type **Dashboard**. Replace `OWNER` with
-   the GitHub account that hosts this repository.
+2. Add `https://github.com/bdeak/echart-graph-card` with type **Dashboard**.
 3. Search HACS for **ECharts Graph Card**, open it and click **Download**.
 4. Reload the browser (hard refresh). HACS adds the dashboard resource
    `/hacsfiles/echart-graph-card/echart-graph-card.js` for you.
@@ -71,7 +70,7 @@ series:
 ### Manual
 
 1. Download `echart-graph-card.js` from the latest
-   [release](https://github.com/OWNER/echart-graph-card/releases), or take `dist/echart-graph-card.js`
+   [release](https://github.com/bdeak/echart-graph-card/releases), or take `dist/echart-graph-card.js`
    from this repository.
 2. Copy it to `/config/www/echart-graph-card.js`.
 3. Add it as a dashboard resource. Go to **Settings → Dashboards → ⋮ → Resources → Add resource**,
