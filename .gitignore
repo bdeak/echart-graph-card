@@ -1,0 +1,7 @@
+node_modules/
+# dist/ is intentionally tracked: HACS serves dist/echart-graph-card.js from the repo/release.
+coverage/
+.vite/
+*.log
+.DS_Store
+.env

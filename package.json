@@ -1,0 +1,42 @@
+{
+  "name": "echart-graph-card",
+  "version": "0.1.0",
+  "description": "Fast, beautiful time-series line charts for Home Assistant Lovelace, powered by Apache ECharts.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Balint Deak",
+  "private": true,
+  "main": "dist/echart-graph-card.js",
+  "module": "dist/echart-graph-card.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite serve dev --config vite.config.ts",
+    "build": "vite build",
+    "test": "vitest run",
+    "lint": "eslint src tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "home-assistant",
+    "lovelace",
+    "custom-card",
+    "echarts",
+    "graph"
+  ],
+  "dependencies": {
+    "echarts": "^6.1.0",
+    "lit": "^3.3.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.3",
+    "eslint": "^10.11.0",
+    "happy-dom": "^20.14.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.70.1",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.2"
+  }
+}
