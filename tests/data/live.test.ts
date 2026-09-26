@@ -236,3 +236,130 @@ describe('LiveBuffer.trim', () => {
     expect(d.points).toEqual([[T0 + M, 1]]);
   });
 });
+
+describe('LiveBuffer.append (grouped series, O(1) open bucket)', () => {
+  const B = 5 * M;
+  const FUNCS = ['avg', 'min', 'max', 'first', 'last', 'sum', 'delta', 'median'] as const;
+
+  /** Deterministic pseudo-random sequence. */
+  function rng(seed: number): () => number {
+    let x = seed;
+    return () => {
+      x = (x * 1103515245 + 12345) % 2147483648;
+      return x / 2147483648;
+    };
+  }
+
+  it.each(FUNCS)('%s matches a full regroup for random updates (replacements, gaps, skipped buckets)', (func) => {
+    const rand = rng(FUNCS.indexOf(func) + 7);
+    const raw: Point[] = [
+      [T0, 100],
+      [T0 + 2 * M, 200],
+      [T0 + 6 * M, 150],
+    ];
+    const [d] = seriesData({ series: [{ entity: 'sensor.p', group_by: { func, duration: '5m' } }] }, [groupBy(raw, func, B)]);
+    d.rawTail = lastBucketTail(raw, B);
+    const buf = new LiveBuffer();
+    buf.reset([d], hassWith([st('sensor.p', '150', T0 + 6 * M)]));
+    const all = [...raw];
+    let t = T0 + 6 * M;
+    for (let k = 0; k < 120; k++) {
+      const r = rand();
+      // Mostly small steps, sometimes the same timestamp (replace) or a jump over buckets.
+      t += r < 0.15 ? 0 : r < 0.9 ? Math.round(rand() * 90_000) : Math.round(rand() * 25 * M);
+      const value = rand() < 0.1 ? null : Math.round(rand() * 1000) / 10;
+      const last = all[all.length - 1];
+      if (last[0] === t) {
+        if (last[1] === value) continue;
+        all[all.length - 1] = [t, value];
+      } else {
+        all.push([t, value]);
+      }
+      buf.append(hassWith([st('sensor.p', value === null ? 'unavailable' : String(value), t, t + 1 + k)]));
+      const expected = groupBy(all, func, B);
+      expect(d.points.map((p) => p[0])).toEqual(expected.map((p) => p[0]));
+      d.points.forEach((p, i) => {
+        if (expected[i][1] === null) expect(p[1]).toBeNull();
+        else expect(p[1]).toBeCloseTo(expected[i][1] as number, 6);
+      });
+      expect(d.rawTail).toEqual(lastBucketTail(all, B));
+    }
+  });
+
+  it('keeps the per-append cost independent of the bucket size (no copies of the open bucket)', () => {
+    const [d] = seriesData({ series: [{ entity: 'sensor.p', group_by: { func: 'avg', duration: '1d' } }] }, [[]]);
+    const buf = new LiveBuffer();
+    buf.reset([d], hassWith([]));
+    const t0 = Date.parse('2026-09-26T00:00:30Z');
+    for (let i = 0; i < 20_000; i++) buf.append(hassWith([st('sensor.p', String(i % 100), t0 + i * 1000)]));
+    const tail = d.rawTail!;
+    buf.append(hassWith([st('sensor.p', '5', t0 + 20_000 * 1000)]));
+    expect(d.rawTail).toBe(tail); // appended in place
+    expect(d.rawTail).toHaveLength(20_001);
+    expect(d.points).toHaveLength(1);
+  });
+});
+
+describe('LiveBuffer domain-aware values', () => {
+  it('plots a person in a named zone as away (0), not as a gap', () => {
+    const [d] = seriesData({ series: ['person.bob'] }, [[[T0, 1]]]);
+    const buf = new LiveBuffer();
+    buf.reset([d], hassWith([st('person.bob', 'home', T0)]));
+    buf.append(hassWith([st('person.bob', 'Work', T0 + M)]));
+    expect(d.points).toEqual([
+      [T0, 1],
+      [T0 + M, 0],
+    ]);
+    expect(d.latest).toBe(0);
+  });
+});
+
+describe('LiveBuffer.backfill', () => {
+  it('merges the missed history of a gap into raw and grouped series', () => {
+    const raw = seriesData({ series: ['sensor.a'] }, [[[T0, 1], [T0 + M, 2]]])[0];
+    const grouped = seriesData({ series: [{ entity: 'sensor.b', group_by: { func: 'max', duration: '5m' } }] }, [[[T0, 5]]])[0];
+    grouped.rawTail = [[T0 + M, 5]];
+    const stats = seriesData({ series: ['sensor.c'] }, [[[T0, 9]]], 'statistics')[0];
+    const buf = new LiveBuffer();
+    buf.reset([raw, grouped, stats], hassWith([]));
+    const gap = T0 + 2 * M;
+    const changed = buf.backfill(
+      {
+        // first row = synthetic "state at start_time" (dropped), then the missed states
+        [raw.series.key]: [
+          [gap, 2],
+          [T0 + 3 * M, 3],
+          [T0 + 4 * M, 4],
+        ],
+        [grouped.series.key]: [
+          [gap, 5],
+          [T0 + 3 * M, 7],
+          [T0 + 6 * M, 6],
+        ],
+        [stats.series.key]: [[T0 + 3 * M, 100]],
+      },
+      gap,
+    );
+    expect(changed).toBe(true);
+    expect(raw.points).toEqual([
+      [T0, 1],
+      [T0 + M, 2],
+      [T0 + 3 * M, 3],
+      [T0 + 4 * M, 4],
+    ]);
+    expect(grouped.points).toEqual(
+      groupBy(
+        [
+          [T0 + M, 5],
+          [T0 + 3 * M, 7],
+          [T0 + 6 * M, 6],
+        ],
+        'max',
+        5 * M,
+      ),
+    );
+    expect(stats.points).toEqual([[T0, 9]]);
+    // Samples the buffer already has (live appends newer than the gap start) are not duplicated.
+    expect(buf.backfill({ [raw.series.key]: [[T0 + 3 * M, 3]] }, gap)).toBe(false);
+  });
+});

@@ -13,6 +13,8 @@ import type {
 export interface StatisticMetadata {
   statistic_id: string;
   statistics_unit_of_measurement?: string | null;
+  /** Unit converter class (`power`, `energy`, `temperature`, ...); null = not convertible. */
+  unit_class?: string | null;
   name?: string | null;
   has_mean?: boolean;
   has_sum?: boolean;
@@ -80,6 +82,8 @@ function rowsToPoints(rows: StatisticValue[], col: StatisticType): Point[] {
  * (epoch ms; ISO strings from older HA are parsed). For `statistic: auto` series whose
  * resolved column has no values at all, the first fallback column with values is used
  * (see statisticCandidates). transform/group_by are NOT applied here.
+ * `units` (unit class -> unit, e.g. `{ power: 'kW' }`) asks HA to convert the rows; without it
+ * rows come in the statistics metadata unit (`statistics_unit_of_measurement`).
  * Rejects if callWS rejects. Empty `series` resolves to `{}` without a call.
  */
 export async function fetchStatistics(
@@ -88,6 +92,7 @@ export async function fetchStatistics(
   start: Date,
   end: Date,
   period: StatisticsPeriod,
+  units?: Record<string, string>,
 ): Promise<Record<string, Point[]>> {
   if (series.length === 0) return {};
   const ids = [...new Set(series.map((s) => s.entity))];
@@ -106,6 +111,7 @@ export async function fetchStatistics(
     period,
     types: [...types],
   };
+  if (units && Object.keys(units).length) msg.units = units;
   const res = await hass.callWS<StatisticsResponse | null>(msg);
   const out: Record<string, Point[]> = {};
   for (const s of series) {
@@ -127,8 +133,9 @@ export async function fetchStatistics(
 
 /**
  * `recorder/get_statistics_metadata` for `ids` -> `statistic_id -> metadata`. Used for the
- * unit/name of external statistics that have no hass.states entity. Resolves `{}` on any error
- * (metadata is cosmetic) and for empty `ids` without a call.
+ * unit/name of external statistics that have no hass.states entity, and to detect statistics
+ * kept in another unit than the entity's current state. Resolves `{}` on any error (metadata is
+ * optional) and for empty `ids` without a call.
  */
 export async function fetchStatisticsMetadata(hass: HomeAssistant, ids: string[]): Promise<Record<string, StatisticMetadata>> {
   const uniq = [...new Set(ids)];

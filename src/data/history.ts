@@ -58,6 +58,25 @@ const NULL_STATES = new Set(['', 'unknown', 'unavailable', 'none', 'null', 'nan'
 const NUMERIC_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/;
 
 /**
+ * HA's `valid_entity_id` (homeassistant/core.py): lower-case `domain.object_id` slugs.
+ * history/history_during_period rejects the WHOLE call (`invalid_entity_ids`) when any requested
+ * id is neither in hass.states nor matches this.
+ */
+const VALID_ENTITY_ID = /^(?!.+__)(?!_)[\da-z_]+(?<!_)\.(?!_)[\da-z_]+(?<!_)$/;
+/** HA's `valid_statistic_id` for external statistics (`source:statistic_id`). */
+const VALID_STATISTIC_ID = /^(?!.+__)(?!_)[\da-z_]+(?<!_):(?!_)[\da-z_]+(?<!_)$/;
+
+/** True for ids Home Assistant accepts as entity ids (`sensor.living_room`). */
+export function isValidEntityId(id: string): boolean {
+  return VALID_ENTITY_ID.test(id);
+}
+
+/** True for external statistic ids (`source:statistic_id`); these only exist in long-term statistics. */
+export function isExternalStatistic(id: string): boolean {
+  return VALID_STATISTIC_ID.test(id);
+}
+
+/**
  * Convert an HA state (or attribute value) to a number.
  * - number -> itself if finite, else null
  * - boolean -> 1/0
@@ -78,8 +97,77 @@ export function stateToNumber(s: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * Domains whose state set is richer than on/off, mapped to the one state that means 0; every
+ * other available state means 1 (and vice versa for person/device_tracker: only `home` is 1).
+ * - cover: `closed` = 0; open / opening / closing / stopped = 1 (not closed yet).
+ * - lock: `locked` = 0; unlocked / unlocking / locking / jammed / open / opening = 1.
+ * - person / device_tracker: `home` = 1; not_home and named zones ("Work") = 0.
+ */
+const DOMAIN_ZERO_STATE: Readonly<Record<string, string>> = { cover: 'closed', lock: 'locked' };
+const DOMAIN_ONE_STATE: Readonly<Record<string, string>> = { person: 'home', device_tracker: 'home' };
+
+/**
+ * The two native states a binary series of `entityId` switches between, as `[state for 0,
+ * state for 1]` (used to translate 0/1 back with hass.formatEntityState): cover closed/open,
+ * lock locked/unlocked, person/device_tracker not_home/home, other on/off-like states their own
+ * pair (`current` = the entity's current state picks e.g. closed/open for a template sensor),
+ * else off/on.
+ */
+export function binaryStatePair(entityId: string, current?: string): [string, string] {
+  switch (domainOf(entityId)) {
+    case 'cover':
+      return ['closed', 'open'];
+    case 'lock':
+      return ['locked', 'unlocked'];
+    case 'person':
+    case 'device_tracker':
+      return ['not_home', 'home'];
+    default:
+      break;
+  }
+  const k = current?.trim().toLowerCase();
+  if (k !== undefined && BINARY_STATE_MAP[k] !== undefined) {
+    for (const pair of BINARY_PAIRS) if (pair.includes(k)) return pair;
+  }
+  return ['off', 'on'];
+}
+
+/** On/off-like state pairs `[0, 1]` of BINARY_STATE_MAP. */
+const BINARY_PAIRS: ReadonlyArray<[string, string]> = [
+  ['off', 'on'],
+  ['false', 'true'],
+  ['closed', 'open'],
+  ['not_home', 'home'],
+  ['locked', 'unlocked'],
+  ['clear', 'detected'],
+];
+
+/**
+ * Number for the STATE of `entityId` (attribute series use stateToNumber on the attribute
+ * value instead). Like stateToNumber, but domain aware for entities with more than two states
+ * (see DOMAIN_ZERO_STATE / DOMAIN_ONE_STATE): a person in the "Work" zone is 0 (away), a
+ * `jammed` lock or a `stopped` cover is 1, instead of a line gap. `unavailable` / `unknown`
+ * stay null.
+ */
+export function entityStateToNumber(entityId: string, s: unknown): number | null {
+  const domain = domainOf(entityId);
+  const zero = DOMAIN_ZERO_STATE[domain];
+  const one = DOMAIN_ONE_STATE[domain];
+  if ((zero === undefined && one === undefined) || typeof s !== 'string') return stateToNumber(s);
+  const k = s.trim().toLowerCase();
+  if (NULL_STATES.has(k)) return null;
+  if (zero !== undefined) return k === zero ? 0 : 1;
+  return k === one ? 1 : 0;
+}
+
+/** Value of series state/attribute `raw` (domain aware for state series). */
+export function seriesValue(entityId: string, raw: unknown, attribute?: string): number | null {
+  return attribute ? stateToNumber(raw) : entityStateToNumber(entityId, raw);
+}
+
 /** `sensor.x` -> `sensor`; external statistic ids (`source:id`) have no domain -> `''`. */
-function domainOf(entityId: string): string {
+export function domainOf(entityId: string): string {
   const dot = entityId.indexOf('.');
   return dot > 0 && !entityId.slice(0, dot).includes(':') ? entityId.slice(0, dot) : '';
 }
@@ -105,9 +193,10 @@ function secToMs(v: unknown): number {
 
 /**
  * Convert the compressed history rows of ONE entity to points (ascending, unique timestamps,
- * clamped to `startMs`). Exported for tests / reuse.
+ * clamped to `startMs`). `entityId` makes state values domain aware (entityStateToNumber).
+ * Exported for tests / reuse.
  */
-export function historyRowsToPoints(rows: HistoryState[] | undefined, startMs: number, attribute?: string): Point[] {
+export function historyRowsToPoints(rows: HistoryState[] | undefined, startMs: number, attribute?: string, entityId = ''): Point[] {
   if (!Array.isArray(rows) || rows.length === 0) return [];
   const pts: Point[] = [];
   let sorted = true;
@@ -118,7 +207,7 @@ export function historyRowsToPoints(rows: HistoryState[] | undefined, startMs: n
     const raw = attribute ? secToMs(row.lu) : secToMs(row.lc ?? row.lu);
     if (Number.isNaN(raw)) continue;
     const t = raw < startMs ? startMs : raw;
-    const v = attribute ? stateToNumber(row.a?.[attribute]) : stateToNumber(row.s);
+    const v = attribute ? stateToNumber(row.a?.[attribute]) : entityStateToNumber(entityId, row.s);
     if (pts.length && t < pts[pts.length - 1][0]) sorted = false;
     pts.push([t, v]);
   }
@@ -168,6 +257,6 @@ export async function fetchHistory(
   const res = await hass.callWS<HistoryResponse | null>(msg);
   const startMs = start.getTime();
   const out: Record<string, Point[]> = {};
-  for (const id of ids) out[id] = historyRowsToPoints(res?.[id], startMs, attribute);
+  for (const id of ids) out[id] = historyRowsToPoints(res?.[id], startMs, attribute, id);
   return out;
 }

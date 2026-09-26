@@ -19,11 +19,14 @@ First version.
   the legend.
 - Data sources: recorder history (`history/history_during_period`) and long-term statistics
   (`recorder/statistics_during_period`, with `mean`/`min`/`max`/`state`/`sum`/`change`).
-  `data_source: auto` switches to statistics above 72 h. When an entity has no statistics it
-  falls back to history.
-- Live updates straight from `hass.states`, without refetching. Redraws are throttled and pause
-  while the tab is hidden. `update: <interval>` refetches on a fixed cadence and `update: none`
-  loads once.
+  `data_source: auto` switches to statistics above 72 h (or when `statistics_period` is set).
+  When an entity has no statistics it falls back to history. External statistics and series
+  with an explicit `statistic` always use statistics. Statistics kept in another unit than the
+  entity's state are converted (or labelled with their own unit).
+- Live updates straight from `hass.states`, without refetching history. Redraws are throttled
+  and pause while the tab is hidden; gaps (hidden tab, view switch, reconnect) are backfilled
+  with one history call for just the gap. Statistics series refresh after each compiled period.
+  `update: <interval>` refetches on a fixed cadence and `update: none` loads once.
 - Series options:
   - `name`, `color` (including `var(--x)`), `unit`, `attribute`
   - `line` (`width`, `smooth`, `step`, `style`), `fill` (`none`/`solid`/`gradient`), `fill_opacity`
@@ -35,11 +38,17 @@ First version.
 - `thresholds`: horizontal reference lines (`value`) and bands (`from`/`to`) with labels.
 - `show` toggles: `legend`, `tooltip`, `header_states`, `zoom`, `extrema`, `points`, `x_axis`,
   `y_axis`.
-- Binary sensors are drawn as 0/1 step lines. `unavailable`/`unknown` states break the line.
-  LTTB sampling kicks in for large series.
+- Binary sensors (and covers, locks, people) are drawn as 0/1 step lines. `unavailable`/`unknown`
+  states break the line; long unchanged periods are drawn flat instead of as ramps.
+- Large series are reduced to first / min / max / last per pixel (cached, updated incrementally);
+  the zoomed range is redrawn at full detail.
+- Thresholds always stay visible (the auto axis includes them); band labels sit above the lines.
+- Unknown options are reported inside the card, with hints for apexcharts-card and
+  mini-graph-card keys.
 - Theme aware (HA light/dark, theme CSS variables). Times follow the HA profile's time zone
   (server or browser) and the locale's number and time formats.
-- Sections-layout sizing (`getGridOptions`) and card-picker registration.
+- Sections-layout sizing (`getGridOptions`: content height by default, fills the cell with
+  `grid_options.rows`) and card-picker registration.
 - Dev harness (`npm run dev`) with a mock `hass` and synthetic data. Example configs live in
   `examples/`. CI builds, a tag-driven release workflow and HACS validation are included.
 

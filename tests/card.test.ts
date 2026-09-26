@@ -55,7 +55,7 @@ vi.mock('../src/chart/echarts', () => ({
   },
 }));
 
-vi.mock('../src/data/loader', () => ({ loadSeriesData: vi.fn() }));
+vi.mock('../src/data/loader', () => ({ loadSeriesData: vi.fn(), loadHistoryRange: vi.fn() }));
 
 vi.mock('../src/chart/options', async (importOriginal) => ({
   ...(await importOriginal<typeof OptionsModule>()),
@@ -73,7 +73,7 @@ vi.mock('../src/chart/format', async (importOriginal) => ({
 
 import { echarts } from '../src/chart/echarts';
 import { buildOptions } from '../src/chart/options';
-import { loadSeriesData } from '../src/data/loader';
+import { loadHistoryRange, loadSeriesData } from '../src/data/loader';
 import { normalizeConfig } from '../src/config';
 import { CARD_NAME } from '../src/const';
 import { EchartGraphCard } from '../src/card';
@@ -81,6 +81,8 @@ import { computeExtrema, thresholdColor } from '../src/header';
 import '../src/index';
 
 const loadMock = vi.mocked(loadSeriesData);
+const rangeMock = vi.mocked(loadHistoryRange);
+const MERGE = { replaceMerge: ['series', 'yAxis', 'visualMap'], lazyUpdate: true, silent: true };
 const buildMock = vi.mocked(buildOptions);
 const initMock = vi.mocked(echarts.init);
 
@@ -178,6 +180,7 @@ beforeEach(() => {
   h.charts.length = 0;
   vi.clearAllMocks();
   loadMock.mockImplementation(async (_hass, cfg, now) => fakeData(cfg, now.getTime()));
+  rangeMock.mockImplementation(async () => ({}));
   buildMock.mockImplementation(() => ({ series: [] }));
 });
 
@@ -247,7 +250,7 @@ describe('static helpers', () => {
 
   it('getGridOptions / getCardSize', () => {
     const el = create({ type: 'custom:echart-graph-card', series: [TEMP] });
-    expect(el.getGridOptions()).toEqual({ columns: 12, min_columns: 4, rows: 4, min_rows: 2 });
+    expect(el.getGridOptions()).toEqual({ columns: 12, min_columns: 4, min_rows: 2 }); // rows: auto (content height)
     expect(el.getCardSize()).toBe(6); // 220px -> 5 units + hero header
     el.setConfig({ type: 'custom:echart-graph-card', title: 'T', height: 100, show: { header_states: false }, series: [TEMP] });
     expect(el.getCardSize()).toBe(3);
@@ -342,7 +345,7 @@ describe('lifecycle', () => {
     await settle(el);
     expect(chart.setOption).toHaveBeenCalledTimes(2); // leading edge, both changes coalesced
     const [opt, opts] = chart.setOption.mock.calls[1];
-    expect(opts).toEqual({ replaceMerge: ['series'], lazyUpdate: true, silent: true });
+    expect(opts).toEqual(MERGE);
     expect((opt as { animation?: boolean }).animation).toBe(false);
     expect(q(el, '.hero-number')?.textContent).toBe('22.5');
     const data = buildMock.mock.calls[buildMock.mock.calls.length - 1][1];
@@ -378,9 +381,11 @@ describe('lifecycle', () => {
     expect(loadMock).toHaveBeenCalledTimes(1);
   });
 
-  it('live mode: re-anchors every minute, reloads statistics every 5 minutes', async () => {
-    vi.useFakeTimers({ now: T0, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
-    loadMock.mockImplementation(async (_h, cfg, now) => fakeData(cfg, now.getTime(), { source: 'statistics' }));
+  it('live mode: re-anchors every minute, refreshes only statistics series after each compile', async () => {
+    vi.useFakeTimers({ now: T0 + 5 * 60_000, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    loadMock.mockImplementation(async (_h, cfg, now, opts) =>
+      fakeData(cfg, now.getTime(), { source: 'statistics' }).filter((d) => !opts?.only || opts.only.has(d.series.key)),
+    );
     const el = await mount({ type: 'custom:echart-graph-card', span: '7d', series: [TEMP] }, hass());
     const chart = lastChart();
     expect(loadMock).toHaveBeenCalledTimes(1);
@@ -388,8 +393,17 @@ describe('lifecycle', () => {
     await settle(el);
     expect(chart.setOption).toHaveBeenCalledTimes(2); // re-anchor (merge)
     expect(chart.setOption.mock.calls[1][1]).toMatchObject({ lazyUpdate: true });
-    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    // Hourly statistics: nothing new before the next hour has been compiled (13:01 UTC).
+    await vi.advanceTimersByTimeAsync(50 * 60_000);
     await settle(el);
+    expect(loadMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+    await settle(el);
+    expect(loadMock).toHaveBeenCalledTimes(2);
+    expect([...(loadMock.mock.calls[1][3]?.only ?? [])]).toEqual([`0:${TEMP}`]);
+    // Drawn by merging (zoom / tooltip survive), not rebuilt.
+    expect(lastCall(chart.setOption)?.[1]).toEqual(MERGE);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(loadMock).toHaveBeenCalledTimes(2);
   });
 
@@ -411,14 +425,18 @@ describe('lifecycle', () => {
     expect(chart.setOption).toHaveBeenCalledTimes(2);
     expect(loadMock).toHaveBeenCalledTimes(1);
 
-    // Hidden for a long time -> full reload on return.
+    // Hidden for a long time -> the gap is backfilled from history (no full reload).
     hidden = true;
     document.dispatchEvent(new Event('visibilitychange'));
+    const hiddenAt = Date.now();
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     hidden = false;
     document.dispatchEvent(new Event('visibilitychange'));
     await settle(el);
-    expect(loadMock).toHaveBeenCalledTimes(2);
+    expect(loadMock).toHaveBeenCalledTimes(1);
+    expect(rangeMock).toHaveBeenCalledTimes(1);
+    expect(rangeMock.mock.calls[0][1].map((s) => s.entity)).toEqual([TEMP]);
+    expect(rangeMock.mock.calls[0][2]).toBe(hiddenAt);
   });
 
   it('discards stale responses when the config changes mid-flight', async () => {
@@ -493,14 +511,182 @@ describe('lifecycle', () => {
     expect(second.setOption).toHaveBeenCalledWith(expect.anything(), { notMerge: true });
   });
 
-  it('sections layout fills the grid cell', async () => {
-    const el = create({ type: 'custom:echart-graph-card', height: 300, series: [TEMP] }, hass());
+  it('sections layout fills the grid cell only with a fixed number of rows', async () => {
+    const el = create({ type: 'custom:echart-graph-card', height: 300, grid_options: { rows: 5 }, series: [TEMP] } as CardConfig, hass());
     el.layout = 'grid';
     document.body.appendChild(el);
     await settle(el);
     expect(q(el, '.chart')?.style.height).toBe('100%');
     expect(el.hasAttribute('fill-height')).toBe(true);
     expect(q(el, 'ha-card')?.classList.contains('fill')).toBe(true);
+
+    // Default (rows: auto) and explicit auto: sized by `height`, like HA's history graph card.
+    for (const grid of [undefined, { rows: 'auto' }]) {
+      const auto = create({ type: 'custom:echart-graph-card', height: 120, grid_options: grid, series: [TEMP] } as CardConfig, hass());
+      auto.layout = 'grid';
+      document.body.appendChild(auto);
+      await settle(auto);
+      expect(q(auto, '.chart')?.style.height).toBe('120px');
+      expect(auto.hasAttribute('fill-height')).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: reconnects, gaps, refresh cadence, merge redraws, zoom
+// ---------------------------------------------------------------------------
+
+describe('reload / catch-up behaviour', () => {
+  const hass = (extra: Partial<HomeAssistant> = {}): HomeAssistant =>
+    makeHass([entity(TEMP, '21.5', { unit_of_measurement: '°C', friendly_name: 'Living room' })], extra);
+  const fake = { toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] as ('setTimeout' | 'clearTimeout' | 'setInterval' | 'clearInterval' | 'Date')[] };
+  const offline = (h: HomeAssistant): HomeAssistant => ({ ...h, connected: false }) as HomeAssistant;
+  const online = (h: HomeAssistant): HomeAssistant => ({ ...h, connected: true }) as HomeAssistant;
+
+  it('retries a failed reload after a WebSocket reconnect even though data is loaded (live/history)', async () => {
+    vi.useFakeTimers({ now: T0, ...fake });
+    const h0 = online(hass());
+    const el = await mount({ type: 'custom:echart-graph-card', series: [TEMP] }, h0);
+    expect(loadMock).toHaveBeenCalledTimes(1);
+
+    // HA restarts: disconnect for 20 min (longer than the window? no: 24h window -> backfill).
+    el.hass = offline(h0);
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    rangeMock.mockRejectedValueOnce({ code: 'unknown_command', message: 'Unknown command.' });
+    el.hass = online(h0);
+    await settle(el);
+    expect(rangeMock).toHaveBeenCalledTimes(1);
+    expect(rangeMock.mock.calls[0][2]).toBe(T0); // gap starts when the socket went down
+    expect(q(el, '.alert.error')?.textContent).toContain('Unknown command');
+
+    // Retried with a full reload once the backoff expired, and the banner clears.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await settle(el);
+    expect(loadMock).toHaveBeenCalledTimes(2);
+    expect(q(el, '.alert.error')).toBeNull();
+  });
+
+  it('measures re-attach staleness from the detach, and backfills only the gap', async () => {
+    vi.useFakeTimers({ now: T0, ...fake });
+    const el = await mount({ type: 'custom:echart-graph-card', series: [TEMP] }, hass());
+    await vi.advanceTimersByTimeAsync(10 * 60_000); // connected for 10 min
+
+    // Quick view switch: no fetch at all.
+    el.remove();
+    await vi.advanceTimersByTimeAsync(1000);
+    document.body.appendChild(el);
+    await settle(el);
+    expect(loadMock).toHaveBeenCalledTimes(1);
+    expect(rangeMock).not.toHaveBeenCalled();
+
+    // Detached for 3 minutes: one history call for just the gap.
+    el.remove();
+    const detachedAt = Date.now();
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    document.body.appendChild(el);
+    await settle(el);
+    expect(loadMock).toHaveBeenCalledTimes(1);
+    expect(rangeMock).toHaveBeenCalledTimes(1);
+    expect(rangeMock.mock.calls[0][2]).toBe(detachedAt);
+
+    // Detached longer than the window: full reload.
+    el.remove();
+    await vi.advanceTimersByTimeAsync(25 * 3_600_000);
+    document.body.appendChild(el);
+    await settle(el);
+    expect(loadMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('merges the backfilled history and pauses live appends while it is in flight', async () => {
+    vi.useFakeTimers({ now: T0, ...fake });
+    const h0 = hass();
+    const el = await mount({ type: 'custom:echart-graph-card', series: [TEMP] }, h0);
+    const pending = deferred<Record<string, Point[]>>();
+    rangeMock.mockImplementationOnce(() => pending.promise);
+    el.remove();
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    document.body.appendChild(el);
+    await settle(el);
+    // A live change during the backfill is not appended yet (it would precede the gap's states).
+    el.hass = withStates(h0, entity(TEMP, '23', { unit_of_measurement: '°C' }, T0 + 5 * 60_000));
+    const key = `0:${TEMP}`;
+    pending.resolve({ [key]: [[T0 + 60_000, 22]] });
+    await settle(el);
+    await vi.advanceTimersByTimeAsync(1100);
+    await settle(el);
+    const data = buildMock.mock.calls[buildMock.mock.calls.length - 1][1];
+    expect(data[0].points.slice(-2)).toEqual([
+      [T0 + 60_000, 22],
+      [T0 + 5 * 60_000, 23],
+    ]);
+  });
+
+  it('never refetches history in live mode, even for long forced-history windows', async () => {
+    vi.useFakeTimers({ now: T0, ...fake });
+    await mount({ type: 'custom:echart-graph-card', span: '7d', data_source: 'history', series: [TEMP] }, hass());
+    await vi.advanceTimersByTimeAsync(3 * 3_600_000);
+    expect(loadMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('redraws interval reloads of the same config by merging (zoom and tooltip survive)', async () => {
+    vi.useFakeTimers({ now: T0, ...fake });
+    const el = await mount({ type: 'custom:echart-graph-card', update: '30s', show: { zoom: true }, series: [TEMP] }, hass());
+    const chart = lastChart();
+    expect(chart.setOption.mock.calls[0][1]).toEqual({ notMerge: true });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await settle(el);
+    expect(loadMock).toHaveBeenCalledTimes(2);
+    expect(lastCall(chart.setOption)?.[1]).toEqual(MERGE);
+    // A data-affecting config change still rebuilds from scratch.
+    el.setConfig({ type: 'custom:echart-graph-card', update: '30s', span: '12h', series: [TEMP] });
+    await settle(el);
+    expect(lastCall(chart.setOption)?.[1]).toEqual({ notMerge: true });
+  });
+});
+
+describe('zoom', () => {
+  const hass = (): HomeAssistant => makeHass([entity(TEMP, '21.5', { unit_of_measurement: '°C' })]);
+
+  it('tracks the zoom window, re-reduces after the gesture and keeps it across rebuilds', async () => {
+    vi.useFakeTimers({ now: T0, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const el = await mount({ type: 'custom:echart-graph-card', show: { zoom: true }, series: [TEMP] }, hass());
+    const chart = lastChart();
+    const calls = chart.setOption.mock.calls.length;
+    chart.handlers.get('datazoom')?.({ type: 'datazoom', batch: [{ start: 40, end: 60 }] });
+    chart.handlers.get('datazoom')?.({ type: 'datazoom', batch: [{ start: 41, end: 61 }] });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(chart.setOption.mock.calls.length).toBe(calls + 1); // debounced: one rebuild
+    expect(lastCall(chart.setOption)?.[1]).toEqual(MERGE);
+    expect(buildMock.mock.calls[buildMock.mock.calls.length - 1][3].zoom).toEqual({ start: 41, end: 61 });
+    // Theme change (notMerge rebuild) keeps it.
+    el.hass = { ...el.hass!, themes: { darkMode: true } };
+    await settle(el);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(buildMock.mock.calls[buildMock.mock.calls.length - 1][3].zoom).toEqual({ start: 41, end: 61 });
+    // Zooming back out clears it.
+    chart.handlers.get('datazoom')?.({ type: 'datazoom', start: 0, end: 100 });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(buildMock.mock.calls[buildMock.mock.calls.length - 1][3].zoom).toBeUndefined();
+  });
+
+  it('enables wheel zoom only while Ctrl is held', async () => {
+    const el = await mount({ type: 'custom:echart-graph-card', show: { zoom: true }, series: [TEMP] }, hass());
+    expect(buildMock.mock.calls[buildMock.mock.calls.length - 1][3].zoomModifier).toBe(false);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', ctrlKey: true }));
+    expect(buildMock.mock.calls[buildMock.mock.calls.length - 1][3].zoomModifier).toBe(true);
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', ctrlKey: false }));
+    expect(buildMock.mock.calls[buildMock.mock.calls.length - 1][3].zoomModifier).toBe(false);
+    const builds = buildMock.mock.calls.length;
+    el.remove();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', ctrlKey: true }));
+    expect(buildMock.mock.calls.length).toBe(builds); // listeners removed with the card
+  });
+});
+
+describe('config warnings', () => {
+  it('shows unknown options inside the card', async () => {
+    const el = await mount({ type: 'custom:echart-graph-card', graph_span: '2h', series: [TEMP] } as CardConfig, makeHass([]));
+    expect(q(el, '.alert.warning')?.textContent).toBe('Unknown option "graph_span" is ignored (use span)');
   });
 });
 
@@ -534,7 +720,7 @@ describe('header chips', () => {
     expect(qa(el, '.chip')[0].classList.contains('off')).toBe(true);
     const ctx = buildMock.mock.calls[buildMock.mock.calls.length - 1][3];
     expect([...(ctx.hiddenKeys ?? [])]).toEqual([`0:${TEMP}`]);
-    expect(lastCall(chart.setOption)?.[1]).toMatchObject({ replaceMerge: ['series'] });
+    expect(lastCall(chart.setOption)?.[1]).toEqual(MERGE);
 
     qa(el, '.chip')[0].querySelector<HTMLButtonElement>('.chip-toggle')!.click();
     await settle(el);

@@ -1,7 +1,8 @@
-import { fetchHistory, isBinaryEntity, stateToNumber } from './history';
+import { fetchHistory, isBinaryEntity, isExternalStatistic, isValidEntityId, seriesValue } from './history';
 import { fetchStatistics, fetchStatisticsMetadata } from './statistics';
 import type { StatisticMetadata } from './statistics';
 import { applyTransform, bucketStart, bucketTimeZone, clipToWindow, groupBy, lastBucketTail, transformValue } from './transform';
+import { attributeUnit } from './units';
 import type { HomeAssistant, NormalizedConfig, NormalizedSeries, Point, SeriesData, StatisticsPeriod } from '../types';
 
 const MINUTE_MS = 60_000;
@@ -10,21 +11,44 @@ const DAY_MS = 24 * HOUR_MS;
 
 type Source = 'history' | 'statistics';
 
+/** Options of loadSeriesData. */
+export interface LoadOptions {
+  /**
+   * Load only the series with these keys (e.g. the card's statistics-only refresh). The result
+   * then contains just those series, in cfg.series order.
+   */
+  only?: ReadonlySet<string>;
+}
+
 /**
  * Backend for one series before any fetch:
- * - forced `history` -> history; attribute series always use history (statistics only exist
- *   for states);
+ * - external statistics (`source:id`) only exist in long-term statistics;
+ * - attribute series always use history (statistics only exist for states);
+ * - an explicit `statistic` column asks for statistics, whatever the window;
+ * - forced `history` -> history;
  * - `statistics` + `dataSourceAuto`: entities present in hass.states without a `state_class`
  *   can't have long-term statistics -> straight to history (saves a round trip);
- * - otherwise statistics (external `source:id` statistics included).
+ * - otherwise statistics.
  */
 function plannedSource(s: NormalizedSeries, cfg: NormalizedConfig, hass: HomeAssistant): Source {
-  if (cfg.dataSource === 'history' || s.attribute) return 'history';
+  if (isExternalStatistic(s.entity)) return 'statistics';
+  if (s.attribute) return 'history';
+  if (s.statistic !== 'auto') return 'statistics';
+  if (cfg.dataSource === 'history') return 'history';
   if (cfg.dataSourceAuto) {
     const st = hass.states?.[s.entity];
     if (st && !st.attributes?.state_class) return 'history';
   }
   return 'statistics';
+}
+
+/**
+ * Whether a statistics series without values may be retried from history: only in auto mode,
+ * never for external statistics (no history exists) or an explicit `statistic` column (history
+ * would silently plot a different quantity, e.g. the meter reading instead of the usage).
+ */
+function canFallBack(s: NormalizedSeries, cfg: NormalizedConfig): boolean {
+  return cfg.dataSourceAuto && s.statistic === 'auto' && !isExternalStatistic(s.entity);
 }
 
 /** Earliest bucket start needed so the first bucket overlapping the window is complete. */
@@ -62,22 +86,19 @@ function statisticsStart(windowStart: number, period: StatisticsPeriod, series: 
 }
 
 /**
- * History for `series` over [aligned window start, end]: one call for all state-based series
- * (deduped entities) plus one call per distinct attribute, in parallel. Returns raw
- * (untransformed) points by series key.
+ * History for `series` over [start, end]: one call for all state-based series (deduped
+ * entities) plus one call per distinct attribute, in parallel. Returns raw (untransformed)
+ * points by series key. Ids Home Assistant would reject (neither in hass.states nor a valid
+ * entity id: HA answers `invalid_entity_ids` for the WHOLE call) are left out and get `[]`.
  */
-async function loadHistory(
-  hass: HomeAssistant,
-  series: NormalizedSeries[],
-  windowStart: number,
-  end: Date,
-  zone: string | undefined,
-): Promise<Record<string, Point[]>> {
+async function loadHistory(hass: HomeAssistant, series: NormalizedSeries[], start: number, end: Date): Promise<Record<string, Point[]>> {
   if (series.length === 0) return {};
-  const start = new Date(alignedStart(windowStart, series, zone));
+  const states = hass.states ?? {};
+  const startDate = new Date(start);
   const stateIds: string[] = [];
   const byAttr = new Map<string, string[]>();
   for (const s of series) {
+    if (states[s.entity] === undefined && !isValidEntityId(s.entity)) continue;
     if (s.attribute) {
       const ids = byAttr.get(s.attribute);
       if (ids) ids.push(s.entity);
@@ -86,8 +107,8 @@ async function loadHistory(
   }
   const attrs = [...byAttr.keys()];
   const [stateRes, ...attrRes] = await Promise.all([
-    fetchHistory(hass, stateIds, start, end),
-    ...attrs.map((a) => fetchHistory(hass, byAttr.get(a) ?? [], start, end, { attribute: a })),
+    fetchHistory(hass, stateIds, startDate, end),
+    ...attrs.map((a) => fetchHistory(hass, byAttr.get(a) ?? [], startDate, end, { attribute: a })),
   ]);
   const attrMaps = new Map(attrs.map((a, i) => [a, attrRes[i]]));
   const out: Record<string, Point[]> = {};
@@ -98,18 +119,46 @@ async function loadHistory(
   return out;
 }
 
+/**
+ * Recorder history of `series` over [start, end] as TRANSFORMED, ungrouped points by series key
+ * (one batched call, see loadHistory). Used by the card to backfill a gap in the live feed
+ * (LiveBuffer.backfill). The first point of each series is the state valid at `start`, stamped
+ * `start`. Rejects when a WebSocket call fails.
+ */
+export async function loadHistoryRange(
+  hass: HomeAssistant,
+  series: NormalizedSeries[],
+  start: number,
+  end: Date,
+): Promise<Record<string, Point[]>> {
+  const raw = await loadHistory(hass, series, start, end);
+  const out: Record<string, Point[]> = {};
+  for (const s of series) out[s.key] = applyTransform(raw[s.key] ?? [], s.transform);
+  return out;
+}
+
 const hasValues = (pts: Point[] | undefined): boolean => !!pts && pts.some((p) => p[1] !== null);
+
+const nonEmpty = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+
+/** Unit of the entity's current state (attribute series: attributeUnit). */
+function stateUnitOf(s: NormalizedSeries, hass: HomeAssistant): string | undefined {
+  if (s.attribute) return attributeUnit(s.entity, s.attribute, hass);
+  return nonEmpty(hass.states?.[s.entity]?.attributes?.unit_of_measurement);
+}
 
 /**
  * Load every series of `cfg` for the window [now - cfg.spanMs, now].
  *
- * Source selection:
- * - `cfg.dataSource === 'history'`: one fetchHistory call for all state-based series
- *   (deduped entities), plus one call per distinct `attribute`.
- * - `cfg.dataSource === 'statistics'`: one fetchStatistics call (period cfg.statisticsPeriod).
- *   Attribute series always use history. With `cfg.dataSourceAuto`, entities in hass.states
- *   without a `state_class` go straight to history, and series whose statistics have no values
- *   fall back to history for the same window (batched).
+ * Source selection (per series, see plannedSource):
+ * - history: one fetchHistory call for all state-based series (deduped entities), plus one call
+ *   per distinct `attribute`.
+ * - statistics: one fetchStatistics call (period cfg.statisticsPeriod) plus, in parallel, the
+ *   statistics metadata. Series whose statistics are kept in another unit than the entity's state
+ *   (display unit changed in HA) are fetched again with `units` so they match the state unit; if
+ *   that is impossible they are labelled with the statistics unit. With `cfg.dataSourceAuto`,
+ *   series whose statistics have no values fall back to history for the same window (batched),
+ *   except external statistics and explicit `statistic` columns.
  * - Fetches start early enough that the first group_by bucket / statistics row covering the
  *   window start is complete; results are clipped so each series starts with the point that
  *   covers the left edge (raw history re-stamped to the window start).
@@ -119,48 +168,87 @@ const hasValues = (pts: Point[] | undefined): boolean => !!pts && pts.some((p) =
  * For grouped history series, `rawTail` = transformed raw points of the last bucket (preceded
  * by the carried-in point, see lastBucketTail).
  * `name` = series.name ?? friendly_name ?? statistics metadata name ?? entity;
- * `unit` = series.unit ?? unit_of_measurement (state series only) ?? statistics metadata unit;
+ * `unit` = series.unit ?? (statistics unit when not convertible) ?? state unit_of_measurement
+ * (attribute series: attributeUnit) ?? statistics metadata unit;
  * `isBinary` via isBinaryEntity; `latest` from hass.states (transformed); `source` = the
  * backend actually used. Entities missing from hass.states AND without data get
- * `error: 'Entity not found: <id>'` and `points: []`; forced statistics without values get a
- * hint in `error`.
+ * `error: 'Entity not found: <id>'` and `points: []`; statistics series without values that
+ * cannot fall back get a hint in `error`.
  *
- * Result is aligned with cfg.series (same length/order, hidden series included). Every
- * SeriesData owns fresh `points` / `rawTail` arrays (safe for LiveBuffer to mutate).
- * Rejects only when a data WebSocket call fails (the card shows the error).
+ * Result is aligned with cfg.series (same length/order, hidden series included), or with the
+ * `opts.only` subset. Every SeriesData owns fresh `points` / `rawTail` arrays (safe for
+ * LiveBuffer to mutate). Rejects only when a data WebSocket call fails (the card shows the error).
  */
-export async function loadSeriesData(hass: HomeAssistant, cfg: NormalizedConfig, now: Date): Promise<SeriesData[]> {
+export async function loadSeriesData(hass: HomeAssistant, cfg: NormalizedConfig, now: Date, opts: LoadOptions = {}): Promise<SeriesData[]> {
   const nowMs = now.getTime();
   const windowStart = nowMs - cfg.spanMs;
   const zone = bucketTimeZone(hass);
-  const states = hass.states ?? {};
+  const only = opts.only;
+  const list = only ? cfg.series.filter((s) => only.has(s.key)) : cfg.series;
 
-  const sources: Source[] = cfg.series.map((s) => plannedSource(s, cfg, hass));
-  const histSeries = cfg.series.filter((_, i) => sources[i] === 'history');
-  const statSeries = cfg.series.filter((_, i) => sources[i] === 'statistics');
-  const metaIds = statSeries.filter((s) => !states[s.entity]).map((s) => s.entity);
+  const sources = new Map<string, Source>(list.map((s) => [s.key, plannedSource(s, cfg, hass)]));
+  const histSeries = list.filter((s) => sources.get(s.key) === 'history');
+  const statSeries = list.filter((s) => sources.get(s.key) === 'statistics');
+  const statStart = new Date(statisticsStart(windowStart, cfg.statisticsPeriod, statSeries, zone));
 
   const [histRaw, statRaw, meta] = await Promise.all([
-    loadHistory(hass, histSeries, windowStart, now, zone),
-    statSeries.length
-      ? fetchStatistics(hass, statSeries, new Date(statisticsStart(windowStart, cfg.statisticsPeriod, statSeries, zone)), now, cfg.statisticsPeriod)
-      : Promise.resolve({} as Record<string, Point[]>),
-    fetchStatisticsMetadata(hass, metaIds),
+    loadHistory(hass, histSeries, alignedStart(windowStart, histSeries, zone), now),
+    statSeries.length ? fetchStatistics(hass, statSeries, statStart, now, cfg.statisticsPeriod) : Promise.resolve({} as Record<string, Point[]>),
+    fetchStatisticsMetadata(
+      hass,
+      statSeries.map((s) => s.entity),
+    ),
   ]);
 
-  const raw: Record<string, Point[]> = { ...histRaw, ...statRaw };
-  if (cfg.dataSourceAuto) {
-    const fallback = statSeries.filter((s) => !hasValues(statRaw[s.key]));
-    if (fallback.length) {
-      const fb = await loadHistory(hass, fallback, windowStart, now, zone);
-      for (const s of fallback) {
-        sources[s.index] = 'history';
-        raw[s.key] = fb[s.key] ?? [];
+  // Statistics kept in another unit than the state (HA keeps compiling in the metadata unit when
+  // the display unit changes): convert them into the state unit, or label them with their own.
+  const unitOverride = new Map<string, string>();
+  const groups: Array<{ units: Record<string, string>; series: NormalizedSeries[] }> = [];
+  for (const s of statSeries) {
+    const m = meta[s.entity];
+    const statUnit = nonEmpty(m?.statistics_unit_of_measurement);
+    const stateUnit = stateUnitOf(s, hass);
+    if (!m || !statUnit || !stateUnit || statUnit === stateUnit) continue;
+    const cls = nonEmpty(m.unit_class);
+    if (!cls) {
+      unitOverride.set(s.key, statUnit);
+      continue;
+    }
+    let g = groups.find((x) => x.units[cls] === undefined || x.units[cls] === stateUnit);
+    if (!g) {
+      g = { units: {}, series: [] };
+      groups.push(g);
+    }
+    g.units[cls] = stateUnit;
+    g.series.push(s);
+  }
+  if (groups.length) {
+    const converted = await Promise.all(
+      groups.map((g) => fetchStatistics(hass, g.series, statStart, now, cfg.statisticsPeriod, g.units).catch(() => undefined)),
+    );
+    groups.forEach((g, i) => {
+      const res = converted[i];
+      for (const s of g.series) {
+        if (res) statRaw[s.key] = res[s.key] ?? [];
+        else unitOverride.set(s.key, meta[s.entity]?.statistics_unit_of_measurement as string);
       }
+    });
+  }
+
+  const raw: Record<string, Point[]> = { ...histRaw, ...statRaw };
+  const fallback = statSeries.filter((s) => canFallBack(s, cfg) && !hasValues(statRaw[s.key]));
+  if (fallback.length) {
+    const fb = await loadHistory(hass, fallback, alignedStart(windowStart, fallback, zone), now);
+    for (const s of fallback) {
+      sources.set(s.key, 'history');
+      raw[s.key] = fb[s.key] ?? [];
+      unitOverride.delete(s.key);
     }
   }
 
-  return cfg.series.map((s, i) => buildSeriesData(s, sources[i], raw[s.key] ?? [], hass, cfg, meta, windowStart, zone));
+  return list.map((s) =>
+    buildSeriesData(s, sources.get(s.key) ?? 'history', raw[s.key] ?? [], hass, cfg, meta, unitOverride.get(s.key), windowStart, zone),
+  );
 }
 
 function buildSeriesData(
@@ -170,6 +258,7 @@ function buildSeriesData(
   hass: HomeAssistant,
   cfg: NormalizedConfig,
   meta: Record<string, StatisticMetadata>,
+  unitOverride: string | undefined,
   windowStart: number,
   zone: string | undefined,
 ): SeriesData {
@@ -188,11 +277,10 @@ function buildSeriesData(
   }
 
   const m = source === 'statistics' ? meta[s.entity] : undefined;
-  const friendly = st?.attributes?.friendly_name;
-  const stateUnit = s.attribute ? undefined : st?.attributes?.unit_of_measurement;
-  const name = s.name ?? (typeof friendly === 'string' && friendly ? friendly : undefined) ?? (m?.name || undefined) ?? s.entity;
-  const unit =
-    s.unit ?? (typeof stateUnit === 'string' && stateUnit ? stateUnit : undefined) ?? (m?.statistics_unit_of_measurement || undefined);
+  const external = isExternalStatistic(s.entity);
+  const friendly = nonEmpty(st?.attributes?.friendly_name);
+  const name = s.name ?? friendly ?? (m?.name || undefined) ?? s.entity;
+  const unit = s.unit ?? unitOverride ?? stateUnitOf(s, hass) ?? (m?.statistics_unit_of_measurement || undefined);
 
   const data: SeriesData = {
     series: s,
@@ -200,13 +288,15 @@ function buildSeriesData(
     unit,
     name,
     isBinary: isBinaryEntity(s.entity, st, s.attribute),
-    latest: st ? transformValue(stateToNumber(s.attribute ? st.attributes?.[s.attribute] : st.state), s.transform) : undefined,
+    latest: st ? transformValue(seriesValue(s.entity, s.attribute ? st.attributes?.[s.attribute] : st.state, s.attribute), s.transform) : undefined,
     source,
   };
   if (rawTail) data.rawTail = rawTail;
-  if (!st && points.length === 0) data.error = `Entity not found: ${s.entity}`;
-  else if (source === 'statistics' && !cfg.dataSourceAuto && !hasValues(points)) {
-    data.error = `No long-term statistics for ${s.entity} in this period (does it have a state_class?)`;
+  if (!st && !external && points.length === 0) data.error = `Entity not found: ${s.entity}`;
+  else if (source === 'statistics' && !hasValues(points) && !canFallBack(s, cfg)) {
+    data.error = external
+      ? `No long-term statistics for ${s.entity} in this period`
+      : `No long-term statistics for ${s.entity} in this period (does it have a state_class?)`;
   }
   return data;
 }

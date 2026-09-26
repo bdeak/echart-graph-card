@@ -1,4 +1,6 @@
 import { DAY, HOUR, MINUTE, SECOND, WEEK } from '../config';
+import { binaryStatePair, domainOf } from '../data/history';
+import { reducePoints, reducePointsDetail } from '../data/reduce';
 import type { ECOption, EChartsCoreOption, LineSeriesOption } from './echarts';
 import { formatAxisValue, formatValue, makeTimeFormatter, timeTicks, zoneMatchesBrowser } from './format';
 import type { TimeFormatter } from './format';
@@ -35,10 +37,23 @@ export interface BuildContext {
    */
   animate?: boolean;
   /**
-   * Chart width in px, optional. Only used to choose the tick density when the display time zone
-   * differs from the browser's (then ticks are computed here instead of by ECharts).
+   * Chart width in px, optional. Enables the point reduction (series with more than 2 points per
+   * px are reduced to first / min / max / last per px, see src/data/reduce.ts) and chooses the
+   * tick density when the display time zone differs from the browser's. Without it large series
+   * fall back to ECharts' LTTB sampling.
    */
   width?: number;
+  /** Chart height in px, optional (drives the y tick count; default: parsed from cfg.height). */
+  height?: number;
+  /**
+   * Current dataZoom window in percent of the x axis (show.zoom). Kept across rebuilds; the
+   * visible range is then reduced at its own, finer resolution. Undefined = not zoomed.
+   */
+  zoom?: { start: number; end: number };
+  /** Touch device: one-finger drags scroll the page unless zoomed in (mirrors ha-chart-base). */
+  touch?: boolean;
+  /** Ctrl is held: the mouse wheel zooms (otherwise it scrolls the page). */
+  zoomModifier?: boolean;
 }
 
 /** One y-axis actually rendered (configured or auto-created). */
@@ -67,6 +82,18 @@ export const THRESHOLD_SERIES_PREFIX = '__thresholds:';
 
 const AXIS_OFFSET_PX = 52;
 const SAMPLING_MIN_POINTS = 1000;
+/** Reduce a series once it has more than this many points per px of chart width. */
+const REDUCE_POINTS_PER_PX = 2;
+/** Sparse history: gaps longer than this many typical sample intervals are drawn as holds... */
+const HOLD_GAP_FACTOR = 3;
+/** ...but never shorter than 5 min, and gaps of an hour or more always are. */
+const HOLD_GAP_MIN_MS = 5 * MINUTE;
+const HOLD_GAP_MAX_MS = HOUR;
+/**
+ * ...and only for jumps of at least this share of the series' value range: a ramp across a small
+ * step (a 0.1 °C quantization step) is off by less than the step and looks better than a stair.
+ */
+const HOLD_MIN_JUMP_RATIO = 0.1;
 const NO_ANIMATION_POINTS = 2000;
 const ANIMATION_MS = 300;
 const FONT_SIZE = 11;
@@ -256,17 +283,79 @@ function extendTo(points: Point[], until: number): Point[] {
 }
 
 /**
- * Points handed to ECharts. History is sample-and-hold, so the last value is extended to `now`
- * (the line reaches the right edge). Stepped statistics rows cover [start, start + period): the
- * last row is extended to its end so its step has a width (like every other bucket).
+ * Typical sample interval of a series: the median of (up to 512 evenly picked) intervals.
+ * Infinity for fewer than two points.
  */
-function plotPoints(d: SeriesData, now: number, bucketMs: number): Point[] {
-  if (d.source === 'history') return extendTo(d.points, now);
-  if (bucketMs > 0 && resolveStep(d.series.line.step, d.isBinary) === 'end') {
-    const last = d.points[d.points.length - 1];
-    if (last) return extendTo(d.points, Math.min(last[0] + bucketMs, now));
+function typicalInterval(points: Point[]): number {
+  const n = points.length;
+  if (n < 2) return Infinity;
+  const step = Math.max(1, Math.floor((n - 1) / 512));
+  const iv: number[] = [];
+  for (let i = 1; i < n; i += step) iv.push(points[i][0] - points[i - 1][0]);
+  iv.sort((a, b) => a - b);
+  return iv[iv.length >> 1];
+}
+
+/**
+ * HA records a state only when it changes, so a long gap between two samples means the first
+ * value held until the second arrived. Straight / smooth lines would draw a long false ramp
+ * across such gaps (a plug at 0 W for 5 h, then 2000 W, would read ~1000 W half way). For gaps
+ * longer than `gapMs` between values at least `minJump` apart, insert hold points so the line
+ * stays flat and jumps at the second sample. The extra points 1 ms after the first / 2 ms and
+ * 1 ms before the second sample keep smoothed curves flat (no overshoot) along the hold.
+ */
+function insertHolds(points: Point[], gapMs: number, minJump: number): Point[] {
+  if (!Number.isFinite(gapMs) || points.length < 2) return points;
+  let out: Point[] | undefined;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    if (a[1] !== null && b[1] !== null && a[1] !== b[1] && Math.abs(b[1] - a[1]) >= minJump && b[0] - a[0] > gapMs) {
+      out ??= points.slice(0, i);
+      out.push([a[0] + 1, a[1]], [b[0] - 2, a[1]], [b[0] - 1, a[1]]);
+    }
+    if (out) out.push(b);
   }
-  return d.points;
+  return out ?? points;
+}
+
+interface PlotOpts {
+  /** Reduction block length (ms per px), 0 = no reduction. */
+  reduceMs: number;
+  /** Reduce only series with more points than this. */
+  reduceAbove: number;
+  /** Zoomed-in range with its finer block length. */
+  detail?: { from: number; to: number; ms: number };
+}
+
+/**
+ * Points handed to ECharts. Large series are reduced to first / min / max / last per pixel
+ * (per finer pixel inside a zoomed range). Raw history is sample-and-hold: long gaps get hold
+ * points (insertHolds) unless the series is stepped anyway, and the last value is extended to
+ * `now` (the line reaches the right edge). Stepped statistics rows cover [start, start +
+ * bucket): the last row is extended to its end so its step has a width (like every other bucket).
+ */
+function plotPoints(d: SeriesData, now: number, bucketMs: number, opts: PlotOpts): Point[] {
+  let pts = d.points;
+  if (opts.reduceMs > 0 && pts.length > opts.reduceAbove) {
+    pts = opts.detail
+      ? reducePointsDetail(pts, opts.reduceMs, opts.detail.from, opts.detail.to, opts.detail.ms)
+      : reducePoints(pts, opts.reduceMs);
+  }
+  const step = resolveStep(d.series.line.step, d.isBinary);
+  if (d.source === 'history') {
+    if (!d.series.groupBy && step === false) {
+      const gap = Math.min(HOLD_GAP_MAX_MS, Math.max(HOLD_GAP_MIN_MS, HOLD_GAP_FACTOR * typicalInterval(d.points)));
+      const { min, max } = valueExtent(pts); // the reduction keeps the extremes
+      pts = insertHolds(pts, gap, max > min ? (max - min) * HOLD_MIN_JUMP_RATIO : Infinity);
+    }
+    return extendTo(pts, now);
+  }
+  if (bucketMs > 0 && step === 'end') {
+    const last = pts[pts.length - 1];
+    if (last) return extendTo(pts, Math.min(last[0] + bucketMs, now));
+  }
+  return pts;
 }
 
 function valueExtent(points: Point[]): ValueExtent {
@@ -343,35 +432,44 @@ function displayPrecision(hass: HomeAssistant, s: NormalizedSeries): number | un
   return typeof p === 'number' && Number.isFinite(p) ? p : undefined;
 }
 
+const humanize = (state: string): string => {
+  const t = state.replace(/_/g, ' ');
+  return t.charAt(0).toUpperCase() + t.slice(1);
+};
+
 /**
- * Tooltip texts for 0/1 of a binary series: the entity's own translated states when the frontend
- * offers `formatEntityState` (door -> Closed / Open), else the generic binary_sensor On / Off.
+ * Tooltip texts for 0/1 of a binary series: the entity's own translated states for its native
+ * state pair (cover closed/open, lock locked/unlocked, person not_home/home, else off/on; see
+ * binaryStatePair) when the frontend offers `formatEntityState` (door -> Closed / Open), else
+ * the domain's generic translations, else the humanized states (On / Off).
  */
 function binaryLabels(hass: HomeAssistant, s?: NormalizedSeries): [string, string] {
   const format = (hass as unknown as { formatEntityState?: (st: HassEntityState, state?: string) => string }).formatEntityState;
   const st = s && !s.attribute ? hass.states?.[s.entity] : undefined;
+  const pair = s ? binaryStatePair(s.entity, st?.state) : (['off', 'on'] as [string, string]);
   if (st && typeof format === 'function') {
     try {
-      const off = format(st, 'off');
-      const on = format(st, 'on');
+      const off = format(st, pair[0]);
+      const on = format(st, pair[1]);
       if (off && on) return [off, on];
     } catch {
       // fall through to the generic labels
     }
   }
   const localize = (hass as unknown as { localize?: (key: string) => string }).localize;
-  const t = (key: string, fallback: string): string => {
+  const tr = (key: string): string => {
     try {
-      const v = typeof localize === 'function' ? localize(key) : '';
-      return v || fallback;
+      return (typeof localize === 'function' ? localize(key) : '') || '';
     } catch {
-      return fallback;
+      return '';
     }
   };
-  return [
-    t('component.binary_sensor.entity_component._.state.off', 'Off'),
-    t('component.binary_sensor.entity_component._.state.on', 'On'),
-  ];
+  const domain = s ? domainOf(s.entity) : '';
+  const label = (state: string): string =>
+    (domain && tr(`component.${domain}.entity_component._.state.${state}`)) ||
+    tr(`component.binary_sensor.entity_component._.state.${state}`) ||
+    humanize(state);
+  return [label(pair[0]), label(pair[1])];
 }
 
 /** Finest data resolution across series (drives seconds / date-only in the tooltip header). */
@@ -379,7 +477,7 @@ function tooltipResolution(cfg: NormalizedConfig, data: SeriesData[]): number {
   let res = Infinity;
   for (const d of data) {
     let r: number;
-    if (d.source === 'statistics') r = PERIOD_MS[cfg.statisticsPeriod] ?? HOUR;
+    if (d.source === 'statistics') r = d.series.groupBy?.durationMs ?? PERIOD_MS[cfg.statisticsPeriod] ?? HOUR;
     else if (d.series.groupBy) r = d.series.groupBy.durationMs;
     else r = cfg.spanMs <= 6 * HOUR ? SECOND : MINUTE;
     res = Math.min(res, r);
@@ -482,19 +580,31 @@ function tooltipFormatter(
   };
 }
 
-function thresholdCarrier(
+/** Band labels are drawn by a second, transparent markArea above the data lines. */
+const LABEL_CARRIER_SUFFIX = ':labels';
+
+/**
+ * Carrier series of one y-axis' thresholds: markLine (lines, z 5 = above the data) and markArea
+ * (bands, z 1 = below the data). Its invisible data points at the threshold values make ECharts
+ * include them in the auto-scaled axis extent (markers alone would not; lines/bands outside the
+ * data range would silently not be drawn). When bands have labels, a second carrier draws them
+ * above the data lines on a subtle background (otherwise lines cross them).
+ */
+function thresholdCarriers(
   axis: ResolvedAxis,
   axisIndex: number,
   list: NormalizedThreshold[],
+  extent: ValueExtent,
+  start: number,
   theme: ThemeColors,
   resolve: (c: string) => string,
-): LineSeriesOption {
+): LineSeriesOption[] {
   const lines = list.filter((t) => t.kind === 'line' && t.value !== undefined);
   const areas = list.filter((t) => t.kind === 'area');
   const colorOf = (t: NormalizedThreshold): string => (t.color ? resolve(t.color) : theme.secondaryText);
-  const carrier: LineSeriesOption = {
+  const base = (id: string, z: number): LineSeriesOption => ({
     type: 'line',
-    id: `${THRESHOLD_SERIES_PREFIX}${axis.id}`,
+    id,
     name: '',
     xAxisIndex: 0,
     yAxisIndex: axisIndex,
@@ -503,8 +613,15 @@ function thresholdCarrier(
     animation: false,
     legendHoverLink: false,
     tooltip: { show: false },
-    z: 1,
-  };
+    symbol: 'none',
+    showSymbol: false,
+    lineStyle: { opacity: 0, width: 0 },
+    z,
+  });
+  const carrier = base(`${THRESHOLD_SERIES_PREFIX}${axis.id}`, 1);
+  if (Number.isFinite(extent.min) && Number.isFinite(extent.max)) {
+    carrier.data = extent.min === extent.max ? [[start, extent.min]] : [[start, extent.min], [start, extent.max]];
+  }
   if (lines.length) {
     carrier.markLine = {
       silent: true,
@@ -526,31 +643,56 @@ function thresholdCarrier(
       }),
     };
   }
+  const bandEnds = (t: NormalizedThreshold): [{ yAxis?: number }, { yAxis?: number }] => [
+    t.from !== undefined ? { yAxis: t.from } : {},
+    t.to !== undefined ? { yAxis: t.to } : {},
+  ];
   if (areas.length) {
     carrier.markArea = {
       silent: true,
       animation: false,
       emphasis: { disabled: true },
       data: areas.map((t) => {
-        const color = colorOf(t);
-        const label = t.label;
-        const from: { yAxis?: number } = t.from !== undefined ? { yAxis: t.from } : {};
-        const to: { yAxis?: number } = t.to !== undefined ? { yAxis: t.to } : {};
+        const [from, to] = bandEnds(t);
+        return [{ name: '', ...from, itemStyle: { color: colorOf(t), opacity: t.opacity }, label: { show: false } }, to];
+      }) as NonNullable<LineSeriesOption['markArea']>['data'],
+    };
+  }
+  const out = [carrier];
+  const labelled = areas.filter((t) => t.label);
+  if (labelled.length) {
+    const labels = base(`${THRESHOLD_SERIES_PREFIX}${axis.id}${LABEL_CARRIER_SUFFIX}`, 3);
+    labels.markArea = {
+      silent: true,
+      animation: false,
+      z: 3,
+      emphasis: { disabled: true },
+      data: labelled.map((t) => {
+        const [from, to] = bandEnds(t);
+        const label = t.label as string;
         return [
           {
-            name: label ?? '',
+            name: label,
             ...from,
-            itemStyle: { color, opacity: t.opacity },
-            label: label
-              ? { show: true, position: 'insideTopLeft', formatter: () => label, color, fontSize: 10, opacity: 0.9 }
-              : { show: false },
+            itemStyle: { color: 'rgba(0, 0, 0, 0)' },
+            label: {
+              show: true,
+              position: 'insideTopLeft',
+              formatter: () => label,
+              color: colorOf(t),
+              fontSize: 10,
+              backgroundColor: withAlpha(theme.background, 0.75) ?? undefined,
+              padding: [1, 4],
+              borderRadius: 3,
+            },
           },
           to,
         ];
       }) as NonNullable<LineSeriesOption['markArea']>['data'],
     };
+    out.push(labels);
   }
-  return carrier;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -616,10 +758,21 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
   const tf = makeTimeFormatter(hass);
   const { axes, seriesAxis } = assignAxes(cfg, data);
   const names = legendNames(data);
-  const totalPoints = data.reduce((n, d) => n + d.points.length, 0);
+  // Statistics rows (and group_by buckets of them) are valid for one bucket each.
+  const bucketList = data.map((d) =>
+    d.source === 'statistics' ? (d.series.groupBy?.durationMs ?? PERIOD_MS[cfg.statisticsPeriod] ?? 0) : 0,
+  );
+  const width = ctx.width && ctx.width > 0 ? ctx.width : undefined;
+  const zoom = cfg.show.zoom && ctx.zoom && (ctx.zoom.start > 0 || ctx.zoom.end < 100) ? ctx.zoom : undefined;
+  const plotOpts: PlotOpts = { reduceMs: width ? Math.max(1, Math.ceil(spanMs / width)) : 0, reduceAbove: (width ?? 0) * REDUCE_POINTS_PER_PX };
+  if (width && zoom) {
+    const from = start + (spanMs * zoom.start) / 100;
+    const to = start + (spanMs * zoom.end) / 100;
+    if (to > from) plotOpts.detail = { from, to, ms: Math.max(1, Math.ceil((to - from) / width)) };
+  }
+  const pointsList = data.map((d, i) => plotPoints(d, now, bucketList[i], plotOpts));
+  const totalPoints = pointsList.reduce((n, p) => n + p.length, 0);
   const animate = ctx.animate !== false && totalPoints <= NO_ANIMATION_POINTS;
-  const bucketList = data.map((d) => (d.source === 'statistics' ? (PERIOD_MS[cfg.statisticsPeriod] ?? 0) : 0));
-  const pointsList = data.map((d, i) => plotPoints(d, now, bucketList[i]));
   // Chart min/max markers only when the header does not already show min / max / avg.
   const markExtrema = cfg.show.extrema && !cfg.show.headerStates;
   const extents = pointsList.map(valueExtent);
@@ -633,8 +786,27 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
   const sideCount: Record<AxisPosition, number> = { left: 0, right: 0 };
   let hasAxisName = false;
   // ~1 y tick per 55px keeps small cards airy (220px -> 4 intervals).
-  const heightPx = /^\s*(\d+(?:\.\d+)?)px\s*$/.exec(cfg.height);
-  const splitNumber = Math.max(2, Math.min(8, Math.round((heightPx ? Number(heightPx[1]) : 220) / 55)));
+  const heightMatch = /^\s*(\d+(?:\.\d+)?)px\s*$/.exec(cfg.height);
+  const heightPx = ctx.height && ctx.height > 0 ? ctx.height : heightMatch ? Number(heightMatch[1]) : 220;
+  const splitNumber = Math.max(2, Math.min(8, Math.round(heightPx / 55)));
+
+  // Thresholds per axis (default: the first axis). Their values count as data for the axis
+  // extent, so a reference line / closed band outside the data range is still shown.
+  const thresholdAxis = (t: NormalizedThreshold): number => {
+    const ai = t.yAxis !== null ? axes.findIndex((a) => a.id === t.yAxis) : 0;
+    return ai < 0 ? 0 : ai;
+  };
+  const thresholdExtents: ValueExtent[] = axes.map(() => ({ min: Infinity, max: -Infinity }));
+  for (const t of cfg.thresholds) {
+    const ai = thresholdAxis(t);
+    if (isBinaryAxis[ai]) continue;
+    const values = t.kind === 'line' ? [t.value] : t.from !== undefined && t.to !== undefined ? [t.from, t.to] : [];
+    for (const v of values) {
+      if (v === undefined || !Number.isFinite(v)) continue;
+      thresholdExtents[ai].min = Math.min(thresholdExtents[ai].min, v);
+      thresholdExtents[ai].max = Math.max(thresholdExtents[ai].max, v);
+    }
+  }
 
   // Bounds per axis: hard, or soft against the extent of its visible series (hidden ones do not stretch it).
   const bounds = axes.map((a, i) => {
@@ -646,6 +818,8 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
       dataMin = Math.min(dataMin, extents[j].min);
       dataMax = Math.max(dataMax, extents[j].max);
     });
+    dataMin = Math.min(dataMin, thresholdExtents[i].min);
+    dataMax = Math.max(dataMax, thresholdExtents[i].max);
     return {
       min: resolveBound(conf?.min, conf?.softMin, dataMin, 'min'),
       max: resolveBound(conf?.max, conf?.softMax, dataMax, 'max'),
@@ -761,8 +935,9 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
 
     info.push({
       data: d,
-      // Statistics rows are looked up by bucket (the synthetic end-of-bucket point would extend the last one).
-      points: bucketList[i] > 0 ? d.points : points,
+      // Looked up in the full-resolution points (sample-and-hold; statistics rows by bucket, so
+      // the synthetic end-of-bucket point must not extend the last one).
+      points: d.points,
       name,
       color,
       stops: useVisualMap ? stops : [],
@@ -798,7 +973,8 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
       legendHoverLink: false,
       z: 2,
     };
-    if (points.length > SAMPLING_MIN_POINTS && !step) opt.sampling = 'lttb';
+    // Reduced series are already at pixel resolution; without a known width fall back to LTTB.
+    if (!plotOpts.reduceMs && points.length > SAMPLING_MIN_POINTS && !step) opt.sampling = 'lttb';
 
     if (s.fill !== 'none' && s.fillOpacity > 0) {
       if (d.isBinary && !useVisualMap) {
@@ -852,16 +1028,15 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
     return opt;
   });
 
-  // Thresholds: one empty carrier series per axis, so hiding a data series never hides them.
+  // Thresholds: carrier series per axis, so hiding a data series never hides them.
   const byAxis = new Map<number, NormalizedThreshold[]>();
   for (const t of cfg.thresholds) {
-    const ai = t.yAxis !== null ? axes.findIndex((a) => a.id === t.yAxis) : 0;
-    const key = ai < 0 ? 0 : ai;
+    const key = thresholdAxis(t);
     const list = byAxis.get(key) ?? [];
     list.push(t);
     byAxis.set(key, list);
   }
-  for (const [ai, list] of byAxis) series.push(thresholdCarrier(axes[ai], ai, list, theme, resolve));
+  for (const [ai, list] of byAxis) series.push(...thresholdCarriers(axes[ai], ai, list, thresholdExtents[ai], start, theme, resolve));
 
   // ---- x axis -------------------------------------------------------------
   const maxTicks = ctx.width && ctx.width > 0 ? Math.max(2, Math.min(12, Math.round(ctx.width / 90))) : 6;
@@ -942,7 +1117,9 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
     pageIconInactiveColor: scaleAlpha(theme.secondaryText, 0.3),
     pageIconSize: 10,
     pageTextStyle: { color: theme.secondaryText, fontSize: 11 },
-    data: names,
+    // Only the series the header chips do not cover (cfg.show.legendKeys); `selected` still
+    // lists every series so hiding works for all of them.
+    data: cfg.show.legendKeys ? names.filter((_, i) => cfg.show.legendKeys.includes(data[i].series.key)) : names,
     selected: legendSelected,
   };
 
@@ -963,15 +1140,23 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
   };
   if (visualMap.length) option.visualMap = visualMap;
   if (cfg.show.zoom) {
+    const touch = ctx.touch === true;
     option.dataZoom = [
       {
         type: 'inside',
         xAxisIndex: 0,
         filterMode: 'none',
+        start: zoom?.start ?? 0,
+        end: zoom?.end ?? 100,
         zoomOnMouseWheel: 'ctrl',
         moveOnMouseWheel: false,
-        moveOnMouseMove: true,
-        preventDefaultMouseMove: true,
+        // Touch: a one-finger drag scrolls the page until the chart is zoomed in (then it pans);
+        // pinch always zooms. Without this every swipe starting on the chart is swallowed.
+        moveOnMouseMove: !touch || zoom !== undefined,
+        preventDefaultMouseMove: !touch || zoom !== undefined,
+        // Mouse: ECharts swallows every wheel event over the plot while wheel zoom is enabled,
+        // so it is only enabled while Ctrl is held (the page scrolls otherwise).
+        zoomLock: !touch && ctx.zoomModifier !== true,
         minValueSpan: MINUTE,
       },
     ];

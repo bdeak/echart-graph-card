@@ -214,3 +214,26 @@ describe('mock hass', () => {
     expect(performance.now() - t0).toBeLessThan(3000);
   });
 });
+
+describe('mock hass fidelity', () => {
+  it('rejects a history request with a malformed unknown id as a whole, like HA', async () => {
+    const { hass } = mock();
+    await expect(
+      hass.callWS({
+        type: 'history/history_during_period',
+        start_time: new Date(Date.now() - 3_600_000).toISOString(),
+        entity_ids: ['sensor.outdoor_temperature', 'tibber:consumption'],
+        minimal_response: true,
+        no_attributes: true,
+        significant_changes_only: false,
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_entity_ids' });
+  });
+
+  it('formats untranslated states raw, like the frontend', () => {
+    const { hass } = mock();
+    const cover = { entity_id: 'cover.garage', state: 'open', attributes: {}, last_changed: '', last_updated: '' };
+    expect(hass.formatEntityState(cover, 'open')).toBe('Open');
+    expect(hass.formatEntityState(cover, 'on')).toBe('on');
+  });
+});

@@ -439,10 +439,23 @@ describe('buildOptions: thresholds', () => {
     expect(opt.yAxis.map((a: any) => a.id)).toEqual(['power', 'limit']);
   });
 
-  it('puts markLine/markArea on empty carrier series (after data series, not in the legend)', () => {
+  it('puts markLine/markArea on invisible carrier series (after data series, not in the legend)', () => {
     expect(opt.series).toHaveLength(3);
     const [power, limit] = opt.series.slice(1);
-    expect(power).toMatchObject({ id: `${THRESHOLD_SERIES_PREFIX}power`, data: [], yAxisIndex: 0, silent: true });
+    // Invisible points at the threshold extent (0 .. 25) make the auto axis include them.
+    expect(power).toMatchObject({
+      id: `${THRESHOLD_SERIES_PREFIX}power`,
+      data: [
+        [NOW - DAY, 0],
+        [NOW - DAY, 25],
+      ],
+      yAxisIndex: 0,
+      silent: true,
+      tooltip: { show: false },
+      showSymbol: false,
+      lineStyle: { opacity: 0 },
+    });
+    expect(limit.data).toEqual([]); // open-ended bands do not stretch the axis
     expect(limit).toMatchObject({ id: `${THRESHOLD_SERIES_PREFIX}limit`, yAxisIndex: 1 });
     expect(opt.legend.data).toEqual(['Grid']);
 
@@ -621,5 +634,219 @@ describe('buildOptions: time zones', () => {
     const midnight = Date.UTC(2026, 8, 25, 22);
     expect(opt.xAxis.axisLabel.formatter(midnight)).toBe('{day|Sat}');
     expect(opt.xAxis.axisLabel.rich.day.color).toBe(THEME.text);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// review fixes
+// ---------------------------------------------------------------------------
+
+describe('buildOptions: thresholds outside the data range', () => {
+  it('extends the auto axis so reference lines and closed bands are drawn (real ECharts)', async () => {
+    const echarts = await import('echarts');
+    const cfg = cfgOf({ thresholds: [{ value: 25, label: 'Too warm' }, { from: 10, to: 12, label: 'Cold' }], series: ['sensor.t'] });
+    const opt = build(cfg, dataFor(cfg, [{ points: series(50, (i) => 19 + (4 * i) / 49), unit: '°C' }]), { animate: false });
+    const chart = echarts.init(null, null, { renderer: 'svg', ssr: true, width: 400, height: 220 });
+    chart.setOption(opt as never);
+    const extent = (chart as any).getModel().getComponent('yAxis', 0).axis.scale.getExtent();
+    expect(extent[0]).toBeLessThanOrEqual(10);
+    expect(extent[1]).toBeGreaterThanOrEqual(25);
+    const svg = chart.renderToSVGString();
+    expect(svg).toContain('Too warm');
+    expect(svg).toContain('Cold');
+    chart.dispose();
+  });
+
+  it('folds threshold values into soft bounds / label precision, but not open bands', () => {
+    const cfg = cfgOf({
+      y_axes: [{ id: 't', unit: '°C', soft_max: 24 }],
+      thresholds: [{ value: 30 }, { from: 40 }],
+      series: ['sensor.t'],
+    });
+    const opt = build(cfg, dataFor(cfg, [{ points: series(10, () => 20), unit: '°C' }]));
+    // soft_max 24 no longer holds (30 is above it) -> auto; the carrier carries only 30.
+    expect(opt.yAxis[0].max).toBeUndefined();
+    expect(opt.series[1].data).toEqual([[NOW - DAY, 30]]);
+  });
+
+  it('draws band labels above the data lines on a subtle background', () => {
+    const cfg = cfgOf({ thresholds: [{ from: 40, to: 60, color: '#10B981', label: 'Comfort' }], series: ['sensor.h'] });
+    const opt = build(cfg, dataFor(cfg, [{ points: series(10, () => 50), unit: '%' }]));
+    const [, area, labels] = opt.series;
+    expect(area.markArea.data[0][0].label.show).toBe(false);
+    expect(labels.id).toBe(`${THRESHOLD_SERIES_PREFIX}unit:%:labels`);
+    expect(labels.markArea.z).toBeGreaterThan(opt.series[0].z);
+    expect(labels.markArea.data[0][0]).toMatchObject({ yAxis: 40, itemStyle: { color: 'rgba(0, 0, 0, 0)' } });
+    expect(labels.markArea.data[0][0].label).toMatchObject({ show: true, position: 'insideTopLeft', color: '#10B981' });
+    expect(labels.markArea.data[0][0].label.backgroundColor).toMatch(/rgba\(255, 255, 255, 0\.75\)/);
+    expect(labels.markArea.data[0][0].label.formatter()).toBe('Comfort');
+    expect(opt.legend.data).toEqual(['sensor.h']);
+  });
+});
+
+describe('buildOptions: binary labels per domain', () => {
+  const fmt = (_s: unknown, state?: string): string => `<${state}>`;
+  it.each([
+    ['cover.garage', 'open', ['closed', 'open']],
+    ['lock.front', 'locked', ['locked', 'unlocked']],
+    ['person.bob', 'Work', ['not_home', 'home']],
+    ['binary_sensor.door', 'on', ['off', 'on']],
+  ])('%s uses its native states %j', (entity, state, [zero, one]) => {
+    const cfg = cfgOf({ series: [entity] });
+    const st = { entity_id: entity, state, attributes: {}, last_changed: '', last_updated: '' };
+    const hass = { ...mockHass(), states: { [entity]: st }, formatEntityState: fmt } as unknown as HomeAssistant;
+    const pts = series(4, (i) => i % 2);
+    const o = build(cfg, dataFor(cfg, [{ points: pts, isBinary: true }]), { hass });
+    expect(o.tooltip.formatter([{ axisValue: pts[0][0] }])).toContain(escape(`<${zero}>`));
+    expect(o.tooltip.formatter([{ axisValue: pts[1][0] }])).toContain(escape(`<${one}>`));
+  });
+
+  it('falls back to domain translations, then humanized states', () => {
+    const cfg = cfgOf({ series: ['cover.garage'] });
+    const pts = series(4, (i) => i % 2);
+    const localize = (k: string): string => (k === 'component.cover.entity_component._.state.open' ? 'Offen' : '');
+    const o = build(cfg, dataFor(cfg, [{ points: pts, isBinary: true }]), { hass: { ...mockHass(), localize } as unknown as HomeAssistant });
+    expect(o.tooltip.formatter([{ axisValue: pts[1][0] }])).toContain('>Offen<');
+    expect(o.tooltip.formatter([{ axisValue: pts[0][0] }])).toContain('>Closed<');
+  });
+
+  const escape = (s: string): string => s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+});
+
+describe('buildOptions: statistics with group_by', () => {
+  it('uses the group_by bucket (not the statistics period) for extension and tooltip', () => {
+    const cfg = cfgOf({
+      span: '10d',
+      statistics_period: 'hour',
+      series: [{ entity: 'sensor.water', statistic: 'change', group_by: { func: 'sum', duration: '1d' }, line: { step: true }, fill: 'solid' }],
+    });
+    const today = NOW - 12 * HOUR; // 00:00 UTC of the current day
+    const rows: Point[] = [
+      [today - DAY, 300],
+      [today, 120],
+    ];
+    const opt = build(cfg, dataFor(cfg, [{ points: rows, source: 'statistics', unit: 'L' }]));
+    // Today's bar reaches now (bucket = 1 day), not just 01:00.
+    expect(opt.series[0].data[opt.series[0].data.length - 1]).toEqual([NOW, 120]);
+    expect(opt.tooltip.formatter([{ axisValue: NOW - HOUR }])).toContain('120 L');
+  });
+});
+
+describe('buildOptions: sparse sample-and-hold history', () => {
+  it('holds the value across long gaps instead of drawing a ramp', () => {
+    const cfg = cfgOf({ series: ['sensor.plug_power'] });
+    const six = NOW - 6 * HOUR;
+    const eleven = NOW - HOUR;
+    const opt = build(cfg, dataFor(cfg, [{ points: [[six, 0], [eleven, 2000]], unit: 'W' }]));
+    expect(opt.series[0].data).toEqual([
+      [six, 0],
+      [six + 1, 0],
+      [eleven - 2, 0],
+      [eleven - 1, 0],
+      [eleven, 2000],
+      [NOW, 2000],
+    ]);
+    // Tooltip half way reads the held value.
+    expect(opt.tooltip.formatter([{ axisValue: NOW - 3.5 * HOUR }])).toContain('>0 W<');
+  });
+
+  it('keeps dense data, equal values, stepped and grouped series untouched', () => {
+    const dense = series(500, (i) => Math.sin(i / 10));
+    const cfg = cfgOf({ series: ['sensor.a', { entity: 'sensor.b', line: { step: true } }, { entity: 'sensor.c', group_by: '1h' }] });
+    const sparse: Point[] = [
+      [NOW - 6 * HOUR, 0],
+      [NOW - HOUR, 5],
+    ];
+    const opt = build(cfg, dataFor(cfg, [{ points: dense }, { points: sparse }, { points: sparse }]));
+    expect(opt.series[0].data).toHaveLength(dense.length + 1);
+    expect(opt.series[1].data).toHaveLength(3);
+    expect(opt.series[2].data).toHaveLength(3);
+    const flat = build(cfgOf({ series: ['sensor.a'] }), dataFor(cfgOf({ series: ['sensor.a'] }), [{ points: [[NOW - 6 * HOUR, 1], [NOW - HOUR, 1]] }]));
+    expect(flat.series[0].data).toHaveLength(3);
+  });
+
+  it('keeps small quantization steps smooth (only jumps of 10 % of the range are held)', () => {
+    const cfg = cfgOf({ series: ['sensor.t'] });
+    const pts: Point[] = [
+      [NOW - 10 * HOUR, 20],
+      [NOW - 8.5 * HOUR, 22], // big jump after a long gap -> held
+      [NOW - 7 * HOUR, 21.9], // 0.1 step after 2 h -> ramp
+      [NOW - 6 * HOUR, 21.8],
+    ];
+    const data = build(cfg, dataFor(cfg, [{ points: pts }])).series[0].data;
+    expect(data).toEqual([
+      pts[0],
+      [pts[0][0] + 1, 20],
+      [pts[1][0] - 2, 20],
+      [pts[1][0] - 1, 20],
+      pts[1],
+      pts[2],
+      pts[3],
+      [NOW, 21.8],
+    ]);
+  });
+});
+
+describe('buildOptions: point reduction', () => {
+  const pts = series(86_400, (i) => 1000 + 500 * Math.sin(i / 3000) + (i % 17) * 10);
+
+  it('reduces large series to a few points per px when the width is known (no LTTB)', () => {
+    const cfg = cfgOf({ series: ['sensor.power', { entity: 'binary_sensor.pump' }] });
+    const opt = build(cfg, dataFor(cfg, [{ points: pts }, { points: series(86_400, (i) => (i % 600 < 300 ? 1 : 0)), isBinary: true }]), { width: 400 });
+    for (const s of opt.series.slice(0, 2)) {
+      expect(s.data.length).toBeLessThan(5 * 400);
+      expect(s.sampling).toBeUndefined();
+    }
+    // The true extremes survive the reduction.
+    const values = opt.series[0].data.map((p: Point) => p[1]);
+    expect(Math.max(...values)).toBe(Math.max(...pts.map((p) => p[1] as number)));
+    // Without a width (tests, unmeasured element) ECharts' LTTB is used for non-stepped series.
+    expect(build(cfg, dataFor(cfg, [{ points: pts }, { points: [] }])).series[0].sampling).toBe('lttb');
+  });
+
+  it('re-reduces the zoomed range at its own resolution and keeps the zoom window', () => {
+    const cfg = cfgOf({ show: { zoom: true }, series: ['sensor.power'] });
+    const zoom = { start: 50, end: 54.1667 }; // one hour
+    const full = build(cfg, dataFor(cfg, [{ points: pts }]), { width: 400 });
+    const zoomed = build(cfg, dataFor(cfg, [{ points: pts }]), { width: 400, zoom });
+    const from = NOW - DAY + DAY * 0.5;
+    const to = NOW - DAY + DAY * 0.541667;
+    const inRange = (o: any) => o.series[0].data.filter((p: Point) => p[0] >= from && p[0] < to).length;
+    expect(inRange(zoomed)).toBeGreaterThan(4 * inRange(full));
+    expect(zoomed.dataZoom[0]).toMatchObject({ start: 50, end: 54.1667 });
+    expect(full.dataZoom[0]).toMatchObject({ start: 0, end: 100 });
+  });
+});
+
+describe('buildOptions: zoom gestures', () => {
+  const cfg = cfgOf({ show: { zoom: true }, series: ['sensor.a'] });
+  const data = dataFor(cfg, [{ points: series(20, (i) => i) }]);
+
+  it('touch: page scrolling wins until zoomed in; pinch always zooms', () => {
+    const idle = build(cfg, data, { touch: true }).dataZoom[0];
+    expect(idle).toMatchObject({ moveOnMouseMove: false, preventDefaultMouseMove: false, zoomLock: false });
+    const zoomed = build(cfg, data, { touch: true, zoom: { start: 20, end: 40 } }).dataZoom[0];
+    expect(zoomed).toMatchObject({ moveOnMouseMove: true, preventDefaultMouseMove: true });
+  });
+
+  it('mouse: drag pans; the wheel only zooms while Ctrl is held (page scroll otherwise)', () => {
+    expect(build(cfg, data).dataZoom[0]).toMatchObject({ moveOnMouseMove: true, zoomLock: true, zoomOnMouseWheel: 'ctrl' });
+    expect(build(cfg, data, { zoomModifier: true }).dataZoom[0]).toMatchObject({ zoomLock: false });
+  });
+});
+
+describe('buildOptions: legend and height', () => {
+  it('lists only the series the header cannot toggle', () => {
+    const cfg = cfgOf({ series: ['sensor.a', 'sensor.b', { entity: 'climate.x', attribute: 'temperature', name: 'Setpoint', show_in_header: false }] });
+    const opt = build(cfg, dataFor(cfg, [{ name: 'A' }, { name: 'B' }, { name: 'Setpoint' }]));
+    expect(opt.legend).toMatchObject({ show: true, data: ['Setpoint'] });
+    expect(Object.keys(opt.legend.selected)).toEqual(['A', 'B', 'Setpoint']);
+  });
+
+  it('derives the y tick count from the measured chart height (sections layout)', () => {
+    const cfg = cfgOf({ height: 120, series: ['sensor.a'] });
+    const data = dataFor(cfg, [{ points: series(10, (i) => i) }]);
+    expect(build(cfg, data).yAxis[0].splitNumber).toBe(2);
+    expect(build(cfg, data, { height: 440 }).yAxis[0].splitNumber).toBe(8);
   });
 });

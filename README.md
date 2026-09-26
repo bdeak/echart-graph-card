@@ -26,15 +26,19 @@ series:
 - **Fast.**
   - All entities load in a single batched WebSocket call.
   - Live values are appended from state changes without refetching, and redraws are throttled.
-  - Large series use LTTB downsampling and animation turns off for big datasets.
-  - Updates pause while the browser tab is hidden.
+  - Large series are reduced to their first / min / max / last value per pixel before drawing, so
+    every peak survives and a redraw costs the same for a day of 1-second data as for a few
+    hundred points. Zooming in re-reduces the visible range at full detail.
+  - Updates pause while the browser tab is hidden. Missed states (tab hidden, view switched,
+    connection lost) are fetched for just the gap.
 - **History and long-term statistics.** Windows up to 72 h use recorder history; longer ones use
   long-term statistics automatically. Statistics can be `mean`, `min`, `max`, `state`, `sum` or
   `change`, for example hourly water use.
 - **Sensible data handling.**
   - `unavailable` and `unknown` states break the line instead of drawing a fake value.
-  - Binary sensors are drawn as 0/1 step lines.
-  - History lines extend to "now".
+  - Binary sensors (and doors, locks, covers, people) are drawn as 0/1 step lines.
+  - History lines extend to "now", and a value that did not change for a long time is drawn
+    flat instead of as a slow ramp (Home Assistant only records changes).
 - **Multiple y-axes.** Series are assigned to axes by unit automatically. You can also configure
   axes yourself with hard or *soft* bounds, a side, and a precision.
 - **Styling.**
@@ -154,10 +158,10 @@ as `var(--accent-color)`.
 | `title` | string | – | Card title. |
 | `hours_to_show` | number | `24` | Window length in hours. Ignored when `span` is set. |
 | `span` | duration | – | Window length, e.g. `2h` or `7d`. Takes precedence over `hours_to_show`. |
-| `height` | number \| CSS length | `220px` | Chart height; a number means px. |
-| `data_source` | `auto` \| `history` \| `statistics` | `auto` | `auto` uses recorder history for windows up to 72 h and long-term statistics above that. In `auto` mode, entities without statistics (no `state_class`) fall back to history. |
-| `statistics_period` | `5minute` \| `hour` \| `day` \| `week` \| `month` | by span | Statistics bucket size. The default is `5minute` for windows up to 2 d, `hour` up to 31 d, and `day` above that. HA keeps 5-minute statistics only for the recorder's purge window (10 days by default). |
-| `update` | `live` \| `none` \| duration \| `{ interval: duration }` | `live` | `live`: new states are appended as they arrive; statistics and long windows also refetch every 5 min. A duration of at least 5 s, such as `60s`, refetches the chart on that cadence; the header values still update live. `none` loads once and keeps the window fixed. |
+| `height` | number \| CSS length | `220px` | Chart height; a number means px. Other units: `rem`, `em`, `vh`, `vw` and the like. `%` and `auto` are not supported. In the sections layout see [below](#sections-layout). |
+| `data_source` | `auto` \| `history` \| `statistics` | `auto` | `auto` uses recorder history for windows up to 72 h and long-term statistics above that (or whenever `statistics_period` is set). In `auto` mode, entities without statistics (no `state_class`) fall back to history. External statistics (`source:id`) and series with an explicit `statistic` always use statistics. |
+| `statistics_period` | `5minute` \| `hour` \| `day` \| `week` \| `month` | by span | Statistics bucket size. The default is `5minute` for windows up to 2 d, `hour` up to 31 d, and `day` above that. Setting it with `data_source: auto` makes the card use statistics for any window. HA keeps 5-minute statistics only for the recorder's purge window (10 days by default). |
+| `update` | `live` \| `none` \| duration \| `{ interval: duration }` | `live` | `live`: new states are appended as they arrive, history is never refetched; statistics series are refreshed right after Home Assistant compiles new statistics (every 5 min for `5minute`, hourly otherwise). A duration of at least 5 s, such as `60s`, refetches the chart on that cadence; the header values still update live. `none` loads once and keeps the window fixed. |
 | `group_by` | duration \| [group_by](#group_by) | – | Default bucketing for every series. A series can override it or opt out with `group_by: false`. |
 | `show` | [show](#show) | | Toggles for header, legend, tooltip, zoom and more. |
 | `y_axes` | list of [y_axes](#y_axes) | auto | Configured value axes. Without it, one axis is created per unit. |
@@ -168,9 +172,9 @@ as `var(--accent-color)`.
 | Option | Default | Description |
 | --- | --- | --- |
 | `header_states` | `true` | Header chips with each series' name and current value. Clicking a chip's name hides or shows the series; clicking the value opens more-info. With a single series the value is shown large next to the title. |
-| `legend` | `true` only with more than one series **and** `header_states: false` | ECharts legend below the chart. By default the header chips act as the legend. |
+| `legend` | auto | ECharts legend below the chart. By default the header chips act as the legend, and the legend only appears for series the chips cannot toggle: series with `show_in_header: false` (or all series with `header_states: false`). `true` lists every series. |
 | `tooltip` | `true` | Tooltip on hover or tap, listing every series at that time. |
-| `zoom` | `false` | Zoom the time axis. Pinch or Ctrl + mouse wheel zooms, dragging pans. |
+| `zoom` | `false` | Zoom the time axis. Pinch or Ctrl + mouse wheel zooms, dragging pans. Without Ctrl the mouse wheel scrolls the page as usual, and on touch screens a swipe scrolls the page until you have zoomed in. Zoom in to see full detail: the visible range is redrawn from every sample. |
 | `extrema` | `false` | Min / max / avg of the visible window in the header chips. With `header_states: false`, min/max markers are drawn on the lines instead. |
 | `points` | `false` | Draw a dot at every data point. |
 | `x_axis` | `true` | Show time axis labels. |
@@ -180,19 +184,19 @@ as `var(--accent-color)`.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `entity` | string | **required** | Entity id (`sensor.x`) or an external statistic id (`source:statistic_id`, statistics only). |
+| `entity` | string | **required** | Entity id (`sensor.x`, lower-case like in Home Assistant; a typo such as `sensor.Living_Room` is reported with a suggestion) or an external statistic id (`source:statistic_id`, always read from long-term statistics). |
 | `name` | string | friendly name | Display name. Falls back to the entity id. |
 | `color` | colour | palette | Line colour. Defaults to the built-in 10-colour palette by position. |
-| `unit` | string | entity unit | Overrides `unit_of_measurement`. Also used for axis matching. |
+| `unit` | string | entity unit | Overrides `unit_of_measurement`. Also used for axis matching. Set it for `attribute` series (except climate temperatures / humidity, see below) and whenever `transform` changes the unit. |
 | `y_axis` | string | auto | `y_axes[].id` to plot on. By default a series uses the configured axis with the same unit, otherwise an automatic axis for its unit. |
-| `attribute` | string | – | Plot this attribute instead of the state, e.g. a climate entity's `temperature` setpoint. It always comes from history, because statistics only exist for states. |
+| `attribute` | string | – | Plot this attribute instead of the state, e.g. a climate entity's `temperature` setpoint. It always comes from history, because statistics only exist for states. Attributes have no unit in Home Assistant: temperature attributes of `climate` / `water_heater` entities get your temperature unit and humidity attributes `%`; set `unit` for anything else. |
 | `line` | [line](#line) | | Width, smoothing, steps, dash style. |
 | `fill` | `none` \| `solid` \| `gradient` | `gradient` for 1–2 series, else `none` (and `none` with 2+ `color_thresholds` stops) | Area fill under the line. |
 | `fill_opacity` | 0..1 | gradient `0.35`, solid `0.2` | Fill strength. For gradients this is the opacity at the line; it fades to 0 at the baseline. |
 | `group_by` | duration \| [group_by](#group_by) \| `false` | card `group_by` | Per-series bucketing. `"5m"` means `{ func: avg, duration: 5m }`. `false` ignores the card-level default. |
-| `transform` | `{ multiply, offset }` | `{ multiply: 1, offset: 0 }` | Applied to every value as `value * multiply + offset`, e.g. `multiply: 0.001` for W to kW or `multiply: -1` to invert. |
+| `transform` | `{ multiply, offset }` | `{ multiply: 1, offset: 0 }` | Applied to every value as `value * multiply + offset`, e.g. `multiply: 0.001` with `unit: kW` for W to kW, or `multiply: -1` to invert. The unit is not changed for you. |
 | `color_thresholds` | list of [color_thresholds](#color_thresholds) | – | Colour the line (and fill) by value. |
-| `statistic` | `mean` \| `min` \| `max` \| `sum` \| `state` \| `change` | auto | Statistics column to plot. Auto picks `state` for `total` / `total_increasing` entities (meters) and `mean` otherwise. Use `change` for "consumption per period". |
+| `statistic` | `mean` \| `min` \| `max` \| `sum` \| `state` \| `change` | auto | Statistics column to plot. Auto picks `state` for `total` / `total_increasing` entities (meters) and `mean` otherwise. Use `change` for "consumption per period". Setting it makes this series use long-term statistics for any window, without falling back to history. |
 | `precision` | 0..10 | display precision | Decimals in the header and tooltip. Defaults to the entity's display precision, otherwise it is chosen from the value. |
 | `show_in_header` | boolean | `true` | Show a header chip for this series. |
 | `hidden` | boolean | `false` | Start hidden. Clicking the header chip or legend entry shows it. |
@@ -271,6 +275,10 @@ thresholds:
   - { from: 80, color: "#EF4444" }                       # everything above 80
 ```
 
+Lines and bands with both ends always stay visible: an automatic axis grows to include them
+(soft bounds too). A band with an open end does not stretch the axis. Use `y_axes` `min`/`max`
+if an axis must not grow.
+
 ### `color_thresholds`
 
 A list of `{ value, color }` stops, in any order. A stop's colour applies from its `value` up to
@@ -293,10 +301,21 @@ color_thresholds:
   History lines are extended to "now" with the last known value.
 - **Live updates** (`update: live`). New states from Home Assistant are appended as they arrive,
   without any request to the recorder. Redraws are throttled to about one per second.
-  Statistics-based series update only their header value between the 5-minute refetches.
+  Statistics-based series update only their header value until Home Assistant has compiled the
+  next statistics period; then only they are refetched. Refreshes keep your zoom and an open
+  tooltip.
+- **Catching up.** When the card missed states (it was on another view for more than a minute,
+  the tab was hidden for 5 minutes or more, or the connection to Home Assistant dropped), it
+  fetches the history of just that gap. A failed load or refresh is retried every 30 seconds.
 - **Gaps.** `unavailable`, `unknown` and non-numeric states break the line.
 - **Binary sensors.** Entities from `binary_sensor`, `input_boolean`, `switch` and similar
-  on/off entities are plotted as 0/1 step lines. The tooltip shows *On*/*Off*.
+  on/off entities are plotted as 0/1 step lines, with the entity's own state names in the
+  tooltip (*On*/*Off*, *Open*/*Closed*, ...). Covers are 1 unless `closed`, locks are 1 unless
+  `locked` (a jammed lock counts as unlocked), and people / device trackers are 1 only at `home`
+  (any other zone counts as away).
+- **Sparse sensors.** Home Assistant records a state only when it changes. When a value did not
+  change for much longer than the sensor usually reports (at most an hour), the line stays flat
+  and then jumps, instead of ramping slowly across the gap.
 - **Tooltip.** The tooltip is attached to the page body, so it is never clipped by the card, and
   it uses the theme colours.
 - **Time zone and formats.** Times follow the time zone setting of your HA profile: *server*
@@ -304,10 +323,20 @@ color_thresholds:
   profile's language, number format and 12/24 h setting.
 - **Errors.** An invalid config shows Home Assistant's error card with the exact path, e.g.
   `Invalid config: series[1].y_axis references unknown y-axis "pwr" (known: power)`. An unknown entity or a
-  failed WebSocket call is shown inside the card, and the load is retried.
+  failed WebSocket call is shown inside the card, and the load is retried. Unknown options are
+  listed inside the card as warnings, with the matching option for common apexcharts-card and
+  mini-graph-card keys (for example `graph_span` → `span`).
 - **Performance.** A 24 h window of three 5-second power sensors is about 50,000 points. It
-  loads with one WebSocket call, is downsampled with LTTB for drawing, and renders without
-  animation.
+  loads with one WebSocket call and is reduced to a few points per pixel before drawing. The
+  reduction and the header's min / max / avg are cached and only updated at the edges as new
+  states arrive, so live redraws stay cheap however long the history is.
+
+### Sections layout
+
+In a sections view the card sizes itself to its content (header plus `height`), like Home
+Assistant's own history graph card. To make it fill a grid cell instead, give it a fixed number
+of rows in the layout editor (`grid_options: { rows: 5 }`); the chart then takes whatever height
+the header leaves.
 
 ## Migrating from apexcharts-card
 
@@ -331,7 +360,7 @@ color_thresholds:
 | `series[].float_precision` | `precision` |
 | `series[].color_threshold` | `color_thresholds` |
 | `series[].extend_to: now` | automatic for history series |
-| `yaxis: [{ id, min: ~-3000, max: ~5000, opposite, decimals }]` | `y_axes: [{ id, soft_min: -3000, soft_max: 5000, position: right, precision }]` (`min`/`max` without `~` stay hard bounds) |
+| `yaxis: [{ id, min: ~-3000, max: ~5000, opposite, decimals }]` | `y_axes: [{ id, soft_min: -3000, soft_max: 5000, position: right, precision }]` (`min`/`max` without `~` stay hard bounds; a leftover `~` value is rejected with this hint) |
 | `series[].yaxis_id` | `y_axis` |
 | `apex_config.annotations.yaxis` | `thresholds` |
 | `all_series_config` | card-level `group_by`; other options are set per series |

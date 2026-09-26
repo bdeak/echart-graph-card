@@ -317,6 +317,171 @@ export function groupBy(points: Point[], func: GroupByFunc, durationMs: number, 
 }
 
 /**
+ * Empty-bucket points between `fromEnd` (end of the last emitted bucket) and `toStart` (start of
+ * the next bucket with samples) while the non-null value `held` is being held (see groupBy).
+ */
+export function fillBuckets(fromEnd: number, toStart: number, func: GroupByFunc, held: number, durationMs: number, zone?: string): Point[] {
+  const out: Point[] = [];
+  const z = zone !== undefined && isValidTimeZone(zone) ? zone : undefined;
+  const fv = fillValue(func, held);
+  let s = fromEnd;
+  while (s < toStart && out.length < MAX_FILL_POINTS) {
+    const [fs, fe] = bucketRange(s, durationMs, z);
+    out.push([fs, fv]);
+    s = fe;
+  }
+  return out;
+}
+
+/**
+ * Incremental aggregate of ONE (open) group_by bucket `[bs, be)`, identical to what groupBy
+ * computes for that bucket, in O(1) per sample (median: O(log n) search + insert).
+ * Samples arrive in time order; a sample with the timestamp of the previous one replaces it.
+ * `carry` is the value held when the bucket starts (see aggregateBucket).
+ */
+export class BucketAccumulator {
+  // Aggregates over the "closed" samples (every sample except the latest one).
+  private _wsum = 0;
+  private _w = 0;
+  private _sum = 0;
+  private _count = 0;
+  private _min = Infinity;
+  private _max = -Infinity;
+  private _first: number | undefined;
+  private _lastVal: number | undefined;
+  private readonly _sorted: number[] = [];
+  private _carryApplies = false;
+  private _started = false;
+  /** Latest sample (not folded into the aggregates, it may still be replaced). */
+  private _t = 0;
+  private _v: number | null = null;
+
+  constructor(
+    readonly func: GroupByFunc,
+    readonly bs: number,
+    readonly be: number,
+    private readonly _carry: number | null | undefined,
+  ) {}
+
+  /** Time of the latest sample (NaN before the first one). */
+  get lastTime(): number {
+    return this._started ? this._t : Number.NaN;
+  }
+
+  /** Value of the latest sample (undefined before the first one). */
+  get lastValue(): number | null | undefined {
+    return this._started ? this._v : undefined;
+  }
+
+  /** Add a sample (`t` >= the previous sample's time, inside the bucket). */
+  push(t: number, v: number | null): void {
+    if (!this._started) {
+      this._started = true;
+      this._carryApplies = t > this.bs && typeof this._carry === 'number';
+      if (this._carryApplies) {
+        const c = this._carry as number;
+        this._wsum += c * (t - this.bs);
+        this._w += t - this.bs;
+      }
+    } else if (t > this._t) {
+      this._fold(t);
+    }
+    this._t = t;
+    this._v = v;
+  }
+
+  private _fold(until: number): void {
+    const v = this._v;
+    if (v === null) return;
+    const dt = until - this._t;
+    this._wsum += v * dt;
+    this._w += dt;
+    this._addValue(v);
+  }
+
+  private _addValue(v: number): void {
+    this._sum += v;
+    this._count++;
+    if (v < this._min) this._min = v;
+    if (v > this._max) this._max = v;
+    if (this._first === undefined) this._first = v;
+    this._lastVal = v;
+    if (this.func === 'median') {
+      const a = this._sorted;
+      let lo = 0;
+      let hi = a.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (a[mid] <= v) lo = mid + 1;
+        else hi = mid;
+      }
+      a.splice(lo, 0, v);
+    }
+  }
+
+  /** The bucket's aggregate if the latest sample holds until the bucket end (null = gap). */
+  value(): number | null {
+    if (!this._started) return null;
+    const v = this._v;
+    const has = v !== null;
+    const count = this._count + (has ? 1 : 0);
+    const carry = this._carryApplies ? (this._carry as number) : undefined;
+    switch (this.func) {
+      case 'avg': {
+        const dt = has ? this.be - this._t : 0;
+        const w = this._w + dt;
+        if (w > 0) return (this._wsum + (has ? (v as number) * dt : 0)) / w;
+        return count ? (this._sum + (has ? (v as number) : 0)) / count : null;
+      }
+      case 'min':
+      case 'max': {
+        let m = this.func === 'min' ? this._min : this._max;
+        if (has) m = this.func === 'min' ? Math.min(m, v as number) : Math.max(m, v as number);
+        if (carry !== undefined) m = this.func === 'min' ? Math.min(m, carry) : Math.max(m, carry);
+        return Number.isFinite(m) ? m : null;
+      }
+      case 'first':
+        if (carry !== undefined) return carry;
+        return this._first ?? (has ? (v as number) : null);
+      case 'last':
+        return has ? (v as number) : (this._lastVal ?? null);
+      case 'sum':
+        return count ? this._sum + (has ? (v as number) : 0) : null;
+      case 'delta': {
+        if (!count) return null;
+        const last = has ? (v as number) : (this._lastVal as number);
+        const first = carry ?? this._first ?? (v as number);
+        return last - first;
+      }
+      case 'median': {
+        if (!count) return null;
+        const a = this._sorted;
+        if (!has) return aggregate(a, 'median');
+        // Median of the sorted closed values plus the latest value, without copying.
+        const n = a.length + 1;
+        const at = (k: number): number => {
+          // k-th smallest of a ∪ {v}
+          let lo = 0;
+          let hi = a.length;
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (a[mid] <= (v as number)) lo = mid + 1;
+            else hi = mid;
+          }
+          if (k < lo) return a[k];
+          if (k === lo) return v as number;
+          return a[k - 1];
+        };
+        const mid = n >> 1;
+        return n % 2 ? at(mid) : (at(mid - 1) + at(mid)) / 2;
+      }
+      default:
+        return null;
+    }
+  }
+}
+
+/**
  * The raw points needed to re-aggregate the LAST bucket of `points` incrementally
  * (SeriesData.rawTail): every point of the last bucket, preceded by the last point before it
  * (the carried-in value) when there is one. `[]` for empty input.

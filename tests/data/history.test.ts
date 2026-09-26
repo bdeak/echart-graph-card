@@ -1,5 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fetchHistory, historyRowsToPoints, isBinaryEntity, stateToNumber } from '../../src/data/history';
+import {
+  binaryStatePair,
+  entityStateToNumber,
+  fetchHistory,
+  historyRowsToPoints,
+  isBinaryEntity,
+  isExternalStatistic,
+  isValidEntityId,
+  seriesValue,
+  stateToNumber,
+} from '../../src/data/history';
 import type { HassEntityState, HassMessage, HistoryResponse, HomeAssistant } from '../../src/types';
 
 const sec = (iso: string): number => Date.parse(iso) / 1000;
@@ -211,5 +221,81 @@ describe('historyRowsToPoints', () => {
     const rows = [{ s: '1', lu: 10 }, { s: '2' }, null, { s: '3', lu: Number.NaN }] as never;
     expect(historyRowsToPoints(rows, 0)).toEqual([[10_000, 1]]);
     expect(historyRowsToPoints(undefined, 0)).toEqual([]);
+  });
+});
+
+describe('entity ids (HA valid_entity_id / valid_statistic_id)', () => {
+  it.each([
+    ['sensor.living_room', true],
+    ['binary_sensor.door_2', true],
+    ['sensor.Living_Room', false],
+    ['sensor.living-room', false],
+    ['sensor._a', false],
+    ['sensor.a_', false],
+    ['sen__sor.a', false],
+    ['sensor.a.b', false],
+    ['tibber:consumption', false],
+  ])('%s valid entity id: %s', (id, ok) => {
+    expect(isValidEntityId(id)).toBe(ok);
+  });
+
+  it('recognises external statistic ids', () => {
+    expect(isExternalStatistic('tibber:energy_consumption')).toBe(true);
+    expect(isExternalStatistic('Tibber:x')).toBe(false);
+    expect(isExternalStatistic('sensor.a')).toBe(false);
+  });
+});
+
+describe('domain-aware binary values', () => {
+  it.each([
+    ['person.bob', 'home', 1],
+    ['person.bob', 'not_home', 0],
+    ['person.bob', 'Work', 0], // named zone = away, not a gap
+    ['device_tracker.phone', 'Office', 0],
+    ['lock.front', 'locked', 0],
+    ['lock.front', 'unlocked', 1],
+    ['lock.front', 'jammed', 1],
+    ['lock.front', 'unlocking', 1],
+    ['cover.garage', 'closed', 0],
+    ['cover.garage', 'closing', 1], // still (partly) open
+    ['cover.garage', 'stopped', 1],
+    ['cover.garage', 'open', 1],
+    ['person.bob', 'unavailable', null],
+    ['lock.front', 'unknown', null],
+    ['binary_sensor.door', 'on', 1],
+    ['sensor.temp', '21.5', 21.5],
+    ['sensor.mode', 'Work', null],
+  ])('%s = %j -> %j', (id, state, expected) => {
+    expect(entityStateToNumber(id, state)).toBe(expected);
+  });
+
+  it('seriesValue uses plain conversion for attributes', () => {
+    expect(seriesValue('person.bob', 'Work')).toBe(0);
+    expect(seriesValue('person.bob', 'Work', 'zone')).toBeNull();
+    expect(seriesValue('climate.a', 21, 'temperature')).toBe(21);
+  });
+
+  it('knows the native state pair of each binary domain', () => {
+    expect(binaryStatePair('cover.garage')).toEqual(['closed', 'open']);
+    expect(binaryStatePair('lock.front')).toEqual(['locked', 'unlocked']);
+    expect(binaryStatePair('person.bob')).toEqual(['not_home', 'home']);
+    expect(binaryStatePair('device_tracker.phone')).toEqual(['not_home', 'home']);
+    expect(binaryStatePair('binary_sensor.door', 'on')).toEqual(['off', 'on']);
+    expect(binaryStatePair('sensor.garage_state', 'Open')).toEqual(['closed', 'open']);
+    expect(binaryStatePair('sensor.x', 'detected')).toEqual(['clear', 'detected']);
+    expect(binaryStatePair('sensor.x', '12')).toEqual(['off', 'on']);
+  });
+
+  it('fetchHistory converts rows per entity domain', async () => {
+    const hass = mockHass({
+      'person.bob': [
+        { s: 'home', lu: sec('2026-09-26T01:00:00Z') },
+        { s: 'Work', lu: sec('2026-09-26T08:00:00Z') },
+        { s: 'not_home', lu: sec('2026-09-26T17:00:00Z') },
+      ],
+    });
+    const out = await fetchHistory(hass, ['person.bob'], new Date('2026-09-26T00:00:00Z'), new Date('2026-09-26T20:00:00Z'));
+    expect(out['person.bob'].map((p) => p[1])).toEqual([1, 0, 0]);
+    expect(historyRowsToPoints([{ s: 'jammed', lu: 1 }], 0, undefined, 'lock.front')).toEqual([[1000, 1]]);
   });
 });

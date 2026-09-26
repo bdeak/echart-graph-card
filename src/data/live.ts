@@ -1,5 +1,6 @@
-import { stateToNumber } from './history';
-import { bucketStart, bucketTimeZone, clipToWindow, groupBy, lastBucketTail, transformValue } from './transform';
+import { seriesValue } from './history';
+import { BucketAccumulator, bucketRange, bucketTimeZone, clipToWindow, fillBuckets, transformValue } from './transform';
+import { attributeUnit } from './units';
 import type { HassEntityState, HomeAssistant, Point, SeriesData } from '../types';
 
 /**
@@ -8,11 +9,14 @@ import type { HassEntityState, HomeAssistant, Point, SeriesData } from '../types
  * Usage (card): after every (re)fetch call `reset(data, hass)` with the `hass` object that was
  * current when the fetch STARTED (so changes that race the fetch are still appended; duplicates
  * are skipped); on each `hass` set call `append(hass)` and, if it returns true, schedule a
- * throttled redraw; before redrawing call `trim(now - cfg.spanMs)`.
+ * throttled redraw; before redrawing call `trim(now - cfg.spanMs)`. After a gap in the live
+ * feed (detached card, reconnect) `backfill()` merges the recorder's history of the gap.
  *
  * The SeriesData objects passed to reset() are owned by the buffer and mutated in place
  * (`points` array contents, `rawTail`, `latest`, and `error`/`name`/`unit` when a previously
- * missing entity appears); `data` exposes them. Point tuples are never mutated, only replaced.
+ * missing entity appears); `data` exposes them. Point tuples are never mutated, only replaced,
+ * and appends only touch points at or after the previous last point's time (the chart's
+ * reduction cache in src/data/reduce.ts relies on that).
  */
 export class LiveBuffer {
   private _data: SeriesData[] = [];
@@ -20,6 +24,8 @@ export class LiveBuffer {
   private readonly _lastUpdated = new Map<string, string>();
   /** entity_id -> the series plotting it. */
   private readonly _byEntity = new Map<string, SeriesData[]>();
+  /** Open group_by bucket per grouped history series (built lazily from `rawTail`). */
+  private readonly _open = new WeakMap<SeriesData, BucketAccumulator>();
 
   /** The series currently tracked (same objects given to reset()). */
   get data(): SeriesData[] {
@@ -48,12 +54,12 @@ export class LiveBuffer {
    * For every tracked entity whose `last_updated` changed since the last call:
    * - update `latest` of every series on that entity (transform applied);
    * - for `source: 'history'` series, append a point at `last_changed` (state series) or
-   *   `last_updated` (attribute series), in ms, value via stateToNumber + transformValue.
+   *   `last_updated` (attribute series), in ms, value via seriesValue + transformValue.
    *   Timestamps never go backwards (clamped to the last point). Skipped if the value equals the
    *   last point's value and the timestamp didn't advance; same timestamp + new value replaces.
-   *   Grouped series: the new raw point is added to `rawTail` and the open bucket is
-   *   re-aggregated with groupBy (same bucket -> last point replaced; new bucket -> empty buckets
-   *   in between filled per groupBy rules, new point pushed, `rawTail` restarted).
+   *   Grouped series: the open bucket is updated incrementally (O(1), BucketAccumulator; same
+   *   bucket -> last point replaced; new bucket -> empty buckets in between filled per groupBy
+   *   rules, new point pushed, `rawTail` restarted).
    * Statistics series only get `latest` updated.
    * Returns true if any series' points or latest changed.
    */
@@ -84,7 +90,32 @@ export class LiveBuffer {
       }
       if (this._lastUpdated.get(id) === st.last_updated) continue;
       this._lastUpdated.set(id, st.last_updated);
-      for (const d of list) if (this._applyState(d, st, getZone)) changed = true;
+      for (const d of list) if (this._applyState(d, st, hass, getZone)) changed = true;
+    }
+    return changed;
+  }
+
+  /**
+   * Merge recorder history of a gap in the live feed into the tracked history series.
+   * `pointsByKey`: series key -> transformed, ungrouped points (ascending) of the gap, e.g. from
+   * loadHistoryRange(). Only points after both `after` (the gap start; this also drops the
+   * recorder's synthetic "state at start_time" row) and the series' own last known sample are
+   * used, appended with the rules of append(). Statistics series are ignored.
+   * Returns true if anything changed.
+   */
+  backfill(pointsByKey: Readonly<Record<string, Point[]>>, after: number, hass?: HomeAssistant): boolean {
+    let changed = false;
+    const zone = bucketTimeZone(hass);
+    const getZone = (): string | undefined => zone;
+    for (const d of this._data) {
+      const pts = pointsByKey[d.series.key];
+      if (d.source !== 'history' || !pts?.length) continue;
+      const since = Math.max(after, lastSampleTime(d));
+      for (const [t, v] of pts) {
+        if (!(t > since)) continue;
+        const added = d.series.groupBy ? this._appendGrouped(d, t, v, getZone) : appendRaw(d.points, t, v);
+        if (added) changed = true;
+      }
     }
     return changed;
   }
@@ -109,20 +140,21 @@ export class LiveBuffer {
     return changed;
   }
 
-  private _applyState(d: SeriesData, st: HassEntityState, getZone: () => string | undefined): boolean {
+  private _applyState(d: SeriesData, st: HassEntityState, hass: HomeAssistant, getZone: () => string | undefined): boolean {
     const s = d.series;
     let changed = false;
     if (d.error !== undefined && d.error === `Entity not found: ${s.entity}`) {
       // The entity appeared after the load: adopt its metadata.
       d.error = undefined;
       if (s.name === undefined && typeof st.attributes?.friendly_name === 'string') d.name = st.attributes.friendly_name;
-      if (d.unit === undefined && !s.attribute && typeof st.attributes?.unit_of_measurement === 'string') {
-        d.unit = st.attributes.unit_of_measurement;
+      if (d.unit === undefined) {
+        const unit = s.attribute ? attributeUnit(s.entity, s.attribute, hass) : st.attributes?.unit_of_measurement;
+        if (typeof unit === 'string' && unit) d.unit = unit;
       }
       changed = true;
     }
     const raw = s.attribute ? st.attributes?.[s.attribute] : st.state;
-    const v = transformValue(stateToNumber(raw), s.transform);
+    const v = transformValue(seriesValue(s.entity, raw, s.attribute), s.transform);
     if (d.latest !== v) {
       d.latest = v;
       changed = true;
@@ -137,30 +169,81 @@ export class LiveBuffer {
     return appended || changed;
   }
 
+  /** The open-bucket accumulator of a grouped series, rebuilt from `rawTail` when missing. */
+  private _accumulator(d: SeriesData, zone: string | undefined): BucketAccumulator | undefined {
+    const known = this._open.get(d);
+    if (known) return known;
+    const g = d.series.groupBy;
+    const tail = d.rawTail;
+    if (!g || !tail?.length) return undefined;
+    const last = tail[tail.length - 1];
+    const [bs, be] = bucketRange(last[0], g.durationMs, zone);
+    let k = 0;
+    let carry: number | null | undefined;
+    if (tail[0][0] < bs) {
+      carry = tail[0][1];
+      k = 1;
+    }
+    const acc = new BucketAccumulator(g.func, bs, be, carry);
+    for (; k < tail.length; k++) acc.push(tail[k][0], tail[k][1]);
+    this._open.set(d, acc);
+    return acc;
+  }
+
   private _appendGrouped(d: SeriesData, t: number, v: number | null, getZone: () => string | undefined): boolean {
     const g = d.series.groupBy;
     if (!g) return false;
-    const tail = d.rawTail ?? [];
-    const lastRaw = tail[tail.length - 1];
-    let newTail: Point[];
-    if (lastRaw) {
-      if (t < lastRaw[0]) t = lastRaw[0];
-      if (t === lastRaw[0]) {
-        if (lastRaw[1] === v) return false;
-        newTail = [...tail.slice(0, -1), [t, v]];
-      } else newTail = [...tail, [t, v]];
-    } else newTail = [[t, v]];
-
     const zone = getZone();
-    // Buckets from the previously open bucket onwards are (re)computed; older ones stay.
-    const from = lastRaw ? bucketStart(lastRaw[0], g.durationMs, zone) : Number.NEGATIVE_INFINITY;
-    const regrouped = groupBy(newTail, g.func, g.durationMs, zone).filter((p) => p[0] >= from);
     const pts = d.points;
-    let k = pts.length;
-    while (k > 0 && pts[k - 1][0] >= from) k--;
-    pts.splice(k, pts.length - k, ...regrouped);
-    d.rawTail = lastBucketTail(newTail, g.durationMs, zone);
+    const acc = this._accumulator(d, zone);
+
+    if (acc) {
+      const lastT = acc.lastTime;
+      if (t < lastT) t = lastT;
+      if (t === lastT && acc.lastValue === v) return false;
+      if (t < acc.be) {
+        // Same (open) bucket: update it in place.
+        const tail = d.rawTail ?? (d.rawTail = []);
+        const tailLast = tail[tail.length - 1];
+        if (t === lastT && tailLast && tailLast[0] === t) tail[tail.length - 1] = [t, v];
+        else tail.push([t, v]);
+        acc.push(t, v);
+        setBucketPoint(pts, acc.bs, acc.value());
+        return true;
+      }
+    }
+
+    // A new bucket starts: the previous one is final (its value already assumed the hold).
+    const [bs, be] = bucketRange(t, g.durationMs, zone);
+    let carry: number | null | undefined;
+    if (acc) {
+      setBucketPoint(pts, acc.bs, acc.value());
+      carry = acc.lastValue;
+      if (typeof carry === 'number' && acc.be < bs) for (const p of fillBuckets(acc.be, bs, g.func, carry, g.durationMs, zone)) pts.push(p);
+    }
+    const next = new BucketAccumulator(g.func, bs, be, carry);
+    next.push(t, v);
+    this._open.set(d, next);
+    pts.push([bs, next.value()]);
+    d.rawTail = acc && carry !== undefined ? [[acc.lastTime, carry], [t, v]] : [[t, v]];
     return true;
+  }
+}
+
+/** Time of the latest raw sample of a history series (grouped: from rawTail), -Infinity if none. */
+function lastSampleTime(d: SeriesData): number {
+  const src = d.series.groupBy ? d.rawTail : d.points;
+  const last = src?.[src.length - 1];
+  return last ? last[0] : Number.NEGATIVE_INFINITY;
+}
+
+/** Set the value of the bucket point at `bs` (the last point), or append it. */
+function setBucketPoint(pts: Point[], bs: number, v: number | null): void {
+  const last = pts[pts.length - 1];
+  if (last && last[0] === bs) {
+    if (last[1] !== v) pts[pts.length - 1] = [bs, v];
+  } else {
+    pts.push([bs, v]);
   }
 }
 

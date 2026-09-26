@@ -3,7 +3,7 @@ import type { PropertyValues, TemplateResult } from 'lit';
 import { property, state } from 'lit/decorators.js';
 import { classMap } from 'lit/directives/class-map.js';
 import { styleMap } from 'lit/directives/style-map.js';
-import { DEFAULTS, MINUTE, SECOND, normalizeConfig } from './config';
+import { DEFAULTS, HOUR, MINUTE, SECOND, normalizeConfig } from './config';
 import { CARD_NAME } from './const';
 import { headerStyles, renderHeader } from './header';
 import { cardStyles } from './styles';
@@ -12,7 +12,7 @@ import type { EChartsCoreOption, EChartsInstance } from './chart/echarts';
 import { buildOptions, legendNames } from './chart/options';
 import { readTheme, resolveColor } from './chart/theme';
 import { LiveBuffer } from './data/live';
-import { loadSeriesData } from './data/loader';
+import { loadHistoryRange, loadSeriesData } from './data/loader';
 import type { CardConfig, HomeAssistant, NormalizedConfig, SeriesData, ThemeColors } from './types';
 
 /** Minimum time between two live (hass-driven) redraws. */
@@ -21,12 +21,21 @@ const REDRAW_THROTTLE_MS = SECOND;
 const REANCHOR_MS = MINUTE;
 /** A failed load is retried at most this often. */
 const RETRY_MS = 30 * SECOND;
-/** Reconnecting after being detached longer than this triggers a full reload. */
+/** Re-attaching after being detached longer than this backfills the missed states. */
 const RECONNECT_STALE_MS = MINUTE;
-/** Returning to a tab hidden longer than this triggers a full reload (states may have been missed). */
+/** Returning to a tab hidden longer than this backfills the missed states. */
 const HIDDEN_STALE_MS = 5 * MINUTE;
 /** Slack for timer jitter when deciding whether a periodic reload is due. */
 const TIMER_SLACK_MS = SECOND;
+/**
+ * HA compiles statistics every 5 minutes (hourly rows at the full hour) a few seconds after the
+ * period ends; statistics series are refreshed this long after each period boundary.
+ */
+const STATS_COMPILE_DELAY_MS = MINUTE;
+/** Re-reduce the zoomed range this long after the last zoom / pan event. */
+const ZOOM_DEBOUNCE_MS = 150;
+/** Rebuild the chart option after a resize that changes width / height by more than this. */
+const RESIZE_REBUILD_RATIO = 0.1;
 
 /** Sections-layout sizing hints (see HA `getGridOptions`). */
 export interface LovelaceGridOptions {
@@ -61,6 +70,14 @@ function sameKey(a: unknown[], b: unknown[]): boolean {
 }
 
 type RedrawKind = 0 | 1 | 2; // 0 = none, 1 = header only, 2 = live chart update (+ header)
+
+/** Next time statistics of `period` can have new rows (just after the next compile). */
+export function nextStatisticsRefresh(now: number, period: NormalizedConfig['statisticsPeriod']): number {
+  const step = period === '5minute' ? 5 * MINUTE : HOUR;
+  return Math.floor((now - STATS_COMPILE_DELAY_MS) / step) * step + step + STATS_COMPILE_DELAY_MS;
+}
+
+const isTouchDevice = (): boolean => typeof window !== 'undefined' && 'ontouchstart' in window;
 
 function errorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -97,14 +114,21 @@ function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
  *   throttled (~1/s) chart update (setOption merge, lazyUpdate, no animation) + header refresh;
  *   other modes refresh only the header. hass.states churn alone never re-renders (shouldUpdate).
  * - Timers: every 60 s (or the `update` interval if shorter) the window is re-anchored to now and
- *   trimmed; a full reload happens every `update.intervalMs` for `update: <interval>`, and every
- *   5 min in live mode when statistics are involved or the span exceeds 72 h. `update: none`
- *   fetches once and keeps the window fixed. Paused while `document.hidden`; catches up on
- *   visibilitychange. Overlapping loads are guarded by a sequence number.
+ *   trimmed; a full reload happens every `update.intervalMs` for `update: <interval>`. In live
+ *   mode history is never refetched; statistics series alone are refreshed just after each
+ *   statistics period was compiled (nextStatisticsRefresh). `update: none` fetches once and keeps
+ *   the window fixed. Paused while `document.hidden`. Gaps in the live feed (detached > 1 min,
+ *   tab hidden >= 5 min, WebSocket reconnect) are backfilled with one history call for just the
+ *   gap (a full reload when the gap is as long as the window). A failed load / refresh is
+ *   retried every 30 s with a full reload. Reloads of unchanged configs redraw by merging
+ *   (zoom, tooltip and animation state survive). Overlapping loads are guarded by a sequence
+ *   number.
  * - Chart: echarts.init on the `.chart` div once connected with hass; ResizeObserver ->
- *   rAF-throttled chart.resize(); disposed (with observer/timers) in disconnectedCallback and
+ *   rAF-throttled chart.resize() (option rebuilt when the size changed a lot: point reduction
+ *   and tick count follow the size); disposed (with observer/timers) in disconnectedCallback and
  *   re-created on reconnect. Theme via readTheme(this, darkMode), re-read when hass.themes /
- *   darkMode / locale change.
+ *   darkMode / locale change. show.zoom: the zoom window survives redraws and rebuilds; touch
+ *   devices only pan once zoomed in, the mouse wheel only zooms while Ctrl is held.
  * - Errors (WS failure, unknown entity) render inside the card, not as a throw.
  */
 export class EchartGraphCard extends LitElement {
@@ -141,12 +165,34 @@ export class EchartGraphCard extends LitElement {
   /** Start time (epoch ms) of the last successful load; also the window end for `update: none`. */
   private _loadedAt = 0;
   private _retryAt = 0;
+  /** The last load / refresh failed: retried (full reload) from `_retryAt` on. */
+  private _reloadFailed = false;
+  /** Partial update in flight (history backfill of a gap, statistics-only refresh). */
+  private _partial?: 'backfill' | 'statistics';
+  private _partialSeq = 0;
+  /** Start of a live-feed gap waiting for a backfill (another partial update was running). */
+  private _pendingGap?: number;
+  /** Live mode: when the statistics series are refreshed next. */
+  private _statsDueAt = Infinity;
+  /** The next `_data` change is a refresh of the same config: redraw by merging. */
+  private _dataRefresh = false;
 
   private _pendingRedraw: RedrawKind = 0;
   private _redrawTimer?: ReturnType<typeof setTimeout>;
   private _lastRedrawAt = 0;
   private _tickTimer?: ReturnType<typeof setInterval>;
   private _hiddenAt?: number;
+  private _detachedAt?: number;
+  /** When the WebSocket was seen disconnected (start of the gap to backfill). */
+  private _disconnectedAt?: number;
+
+  /** show.zoom: current zoom window in percent, undefined = not zoomed. */
+  private _zoom?: { start: number; end: number };
+  private _zoomTimer?: ReturnType<typeof setTimeout>;
+  private _zoomModifier = false;
+  private readonly _touch = isTouchDevice();
+  /** Chart size the current option was built for. */
+  private _builtSize: [number, number] = [0, 0];
 
   // ---------------------------------------------------------------------------
   // HA card API
@@ -186,6 +232,8 @@ export class EchartGraphCard extends LitElement {
       this._haveSig = undefined;
       this._error = undefined;
       this._retryAt = 0;
+      this._reloadFailed = false;
+      this._zoom = undefined;
     }
 
     if (this.isConnected) this._startTicker();
@@ -205,9 +253,12 @@ export class EchartGraphCard extends LitElement {
     return Math.max(2, size);
   }
 
-  /** Sections layout defaults. */
+  /**
+   * Sections layout defaults. No `rows`: the card sizes to its content (`height`), like HA's own
+   * history graph card; it fills the grid cell only when the user sets `grid_options.rows`.
+   */
   public getGridOptions(): LovelaceGridOptions {
-    return { columns: 12, min_columns: 4, rows: 4, min_rows: 2 };
+    return { columns: 12, min_columns: 4, min_rows: 2 };
   }
 
   /** Config inserted when the card is picked in the UI card picker. */
@@ -226,26 +277,38 @@ export class EchartGraphCard extends LitElement {
   public override connectedCallback(): void {
     super.connectedCallback();
     document.addEventListener('visibilitychange', this._onVisibilityChange);
+    window.addEventListener('keydown', this._onKey);
+    window.addEventListener('keyup', this._onKey);
+    window.addEventListener('blur', this._onBlur);
     this._hiddenAt = document.hidden ? Date.now() : undefined;
     this._startTicker();
+    const detachedAt = this._detachedAt;
+    this._detachedAt = undefined;
     if (!this._config || !this._hass) return;
-    // Re-attached (e.g. view switch): chart is re-created in updated(); refresh stale data.
-    if (this._loaded && this._config.update.mode !== 'none' && Date.now() - this._loadedAt > RECONNECT_STALE_MS) {
-      void this._load();
+    // Re-attached (e.g. view switch): the chart is re-created in updated(). States that arrived
+    // while detached were not appended: backfill them when it was long enough to matter.
+    if (this._loaded && detachedAt !== undefined && Date.now() - detachedAt > RECONNECT_STALE_MS) {
+      this._catchUp(detachedAt);
     } else {
       this._maybeLoad();
-      if (this._loaded && this._config.update.mode === 'live') this._live.append(this._hass);
-      if (this._loaded) this._scheduleRedraw(2);
+      if (this._loaded && this._config.update.mode === 'live' && !this._backfilling()) this._live.append(this._hass);
     }
+    if (this._loaded) this._scheduleRedraw(2);
     this._rev++;
   }
 
   public override disconnectedCallback(): void {
     super.disconnectedCallback();
+    this._detachedAt = Date.now();
     document.removeEventListener('visibilitychange', this._onVisibilityChange);
+    window.removeEventListener('keydown', this._onKey);
+    window.removeEventListener('keyup', this._onKey);
+    window.removeEventListener('blur', this._onBlur);
     this._stopTicker();
     if (this._redrawTimer !== undefined) clearTimeout(this._redrawTimer);
     this._redrawTimer = undefined;
+    if (this._zoomTimer !== undefined) clearTimeout(this._zoomTimer);
+    this._zoomTimer = undefined;
     if (this._resizeRaf !== undefined) cancelAnimationFrame(this._resizeRaf);
     this._resizeRaf = undefined;
     if (this._themeRaf !== undefined) cancelAnimationFrame(this._themeRaf);
@@ -291,10 +354,11 @@ export class EchartGraphCard extends LitElement {
           : cfg.title
             ? html`<div class="header"><div class="title">${cfg.title}</div></div>`
             : nothing}
-        ${this._error || seriesErrors.length
+        ${this._error || seriesErrors.length || cfg.warnings.length
           ? html`<div class="alerts">
               ${this._error ? html`<div class="alert error" role="alert">${this._error}</div>` : nothing}
               ${seriesErrors.map((e) => html`<div class="alert warning">${e}</div>`)}
+              ${cfg.warnings.map((w) => html`<div class="alert warning">${w}</div>`)}
             </div>`
           : nothing}
         <div class="chart-wrap">
@@ -314,6 +378,8 @@ export class EchartGraphCard extends LitElement {
     const styleChanged = !sameKey(styleKey, this._styleKey);
     this._styleKey = styleKey;
 
+    const refresh = this._dataRefresh;
+    this._dataRefresh = false;
     if (created) return; // _ensureChart already drew the current state.
     if (styleChanged && this._chart && this._styleKey.length) {
       // HA applies theme variables around the same update; read them one frame later.
@@ -325,7 +391,8 @@ export class EchartGraphCard extends LitElement {
       });
     }
     if (changed.has('_config') || changed.has('_data') || changed.has('_loaded')) {
-      if (this._loaded) this._applyChart(true);
+      // A reload of the unchanged config merges (keeps zoom, open tooltip, no entry animation).
+      if (this._loaded) this._applyChart(changed.has('_config') || changed.has('_loaded') || !refresh);
       else this._chart?.clear();
     } else if (changed.has('_hiddenKeys')) {
       this._applyChart(false);
@@ -342,18 +409,23 @@ export class EchartGraphCard extends LitElement {
 
     const connected = (hass as HassRuntimeExtras).connected;
     const wasConnected = (old as HassRuntimeExtras | undefined)?.connected;
+    if (connected === false && wasConnected !== false) this._disconnectedAt ??= Date.now();
     if (old && wasConnected === false && connected !== false && this._loaded) {
-      // WebSocket reconnected: states may have been missed.
-      void this._load();
+      // WebSocket reconnected (e.g. HA restarted): states may have been missed.
+      const gapStart = this._disconnectedAt ?? this._loadedAt;
+      this._disconnectedAt = undefined;
+      this._catchUp(gapStart);
+      this._scheduleRedraw(2);
       return;
     }
 
     if (!this._loaded) this._maybeLoad();
     if (!old || !this._trackedChanged(hass, old)) return;
 
-    // Header values always follow hass.states; the chart only in live mode.
+    // Header values always follow hass.states; the chart only in live mode (paused while a
+    // backfill is in flight; it catches up when the backfill is merged).
     let chartDirty = false;
-    if (this._loaded && cfg.update.mode === 'live') chartDirty = this._live.append(hass);
+    if (this._loaded && cfg.update.mode === 'live' && !this._backfilling()) chartDirty = this._live.append(hass);
     this._scheduleRedraw(chartDirty ? 2 : 1);
   }
 
@@ -378,6 +450,25 @@ export class EchartGraphCard extends LitElement {
     void this._load();
   }
 
+  /** Cosmetic setConfig while a fetch was in flight (same data signature): bind to the newest series. */
+  private _rebind(data: SeriesData[], cfg: NormalizedConfig): void {
+    const latest = this._config;
+    if (!latest || latest === cfg) return;
+    const byKey = new Map(latest.series.map((s) => [s.key, s]));
+    for (const d of data) d.series = byKey.get(d.series.key) ?? d.series;
+  }
+
+  private _fail(e: unknown): void {
+    this._error = `Could not load data: ${errorMessage(e)}`;
+    this._retryAt = Date.now() + RETRY_MS;
+    this._reloadFailed = true;
+  }
+
+  /** A history backfill of the current dataset is in flight (live appends wait for it). */
+  private _backfilling(): boolean {
+    return this._partial === 'backfill' && this._partialSeq === this._loadSeq;
+  }
+
   /** (Re)load all series for the current config. Stale responses are discarded. */
   private async _load(): Promise<void> {
     const cfg = this._config;
@@ -389,46 +480,135 @@ export class EchartGraphCard extends LitElement {
     const seq = ++this._loadSeq;
     this._inflightSig = sig;
     const startedAt = Date.now();
+    // Same config as the data on screen: a refresh, drawn by merging.
+    const refresh = this._loaded && this._haveSig === sig;
     try {
       const data = await loadSeriesData(hass, cfg, new Date(startedAt));
       if (seq !== this._loadSeq) return;
+      this._rebind(data, cfg);
       // Snapshot the hass the fetch was based on, then catch up on anything newer.
-      const latestCfg = this._config;
-      if (latestCfg && latestCfg !== cfg) {
-        // Cosmetic setConfig while in flight (same data signature): bind to the newest series.
-        data.forEach((d, i) => {
-          d.series = latestCfg.series[i] ?? d.series;
-        });
-      }
       this._live.reset(data, hass);
       const current = this._hass;
       if (cfg.update.mode === 'live' && current && current !== hass) this._live.append(current);
+      this._dataRefresh = refresh;
       this._data = data;
       this._haveSig = sig;
       this._loadedAt = startedAt;
       this._loaded = true;
       this._error = undefined;
       this._retryAt = 0;
+      this._reloadFailed = false;
+      this._pendingGap = undefined;
+      this._statsDueAt = this._nextStatsDue(data, startedAt);
     } catch (e) {
       if (seq !== this._loadSeq) return;
-      this._error = `Could not load data: ${errorMessage(e)}`;
-      this._retryAt = Date.now() + RETRY_MS;
+      this._fail(e);
     } finally {
       if (seq === this._loadSeq) this._inflightSig = undefined;
     }
   }
 
-  /** Full reload cadence for the current config/data, Infinity when never. */
-  private _reloadEveryMs(): number {
+  /**
+   * Live-feed gap [gapStart, now] (detached, hidden, WebSocket down). Live mode: backfill the
+   * history series with one call for just the gap (a full reload when the gap covers the whole
+   * window or the last load failed). Interval mode: reload if due. `update: none`: nothing.
+   */
+  private _catchUp(gapStart: number): void {
     const cfg = this._config;
-    if (!cfg || cfg.update.mode === 'none') return Infinity;
-    if (cfg.update.mode === 'interval') return cfg.update.intervalMs;
-    const usesStatistics = cfg.dataSource === 'statistics' || this._data.some((d) => d.source === 'statistics');
-    return usesStatistics || cfg.spanMs > DEFAULTS.autoHistoryMaxSpanMs ? cfg.update.intervalMs : Infinity;
+    if (!cfg || !this._loaded || cfg.update.mode === 'none') return;
+    const now = Date.now();
+    if (this._reloadFailed || now - gapStart >= cfg.spanMs || (cfg.update.mode === 'interval' && this._reloadDue(now))) {
+      void this._load();
+      return;
+    }
+    if (cfg.update.mode === 'live') void this._backfill(gapStart);
   }
 
+  /** Merge the recorder history of [gapStart, now] into the live history series. */
+  private async _backfill(gapStart: number): Promise<void> {
+    const cfg = this._config;
+    const hass = this._hass;
+    if (!cfg || !hass || !this._loaded) return;
+    if (this._inflightSig !== undefined) return; // a full load is running and covers the gap
+    if (this._partial) {
+      this._pendingGap = Math.min(this._pendingGap ?? gapStart, gapStart);
+      return;
+    }
+    const series = this._data.filter((d) => d.source === 'history' && !d.error).map((d) => d.series);
+    if (series.length === 0) return;
+    const seq = this._loadSeq;
+    this._partial = 'backfill';
+    this._partialSeq = seq;
+    try {
+      const pts = await loadHistoryRange(hass, series, gapStart, new Date());
+      if (seq !== this._loadSeq) return;
+      this._live.backfill(pts, gapStart, this._hass);
+      if (this._hass) this._live.append(this._hass);
+      this._error = undefined;
+      this._reloadFailed = false;
+      this._scheduleRedraw(2);
+    } catch (e) {
+      if (seq !== this._loadSeq) return;
+      this._fail(e);
+    } finally {
+      this._partialDone();
+    }
+  }
+
+  /** Live mode: reload only the statistics series (history stays live). */
+  private async _refreshStatistics(): Promise<void> {
+    const cfg = this._config;
+    const hass = this._hass;
+    if (!cfg || !hass || !this._loaded || this._partial || this._inflightSig !== undefined) return;
+    const keys = new Set(this._data.filter((d) => d.source === 'statistics').map((d) => d.series.key));
+    if (keys.size === 0) {
+      this._statsDueAt = Infinity;
+      return;
+    }
+    const seq = this._loadSeq;
+    this._partial = 'statistics';
+    this._partialSeq = seq;
+    const startedAt = Date.now();
+    try {
+      const fresh = await loadSeriesData(hass, cfg, new Date(startedAt), { only: keys });
+      if (seq !== this._loadSeq) return;
+      this._rebind(fresh, cfg);
+      const byKey = new Map(fresh.map((d) => [d.series.key, d]));
+      const next = this._data.map((d) => byKey.get(d.series.key) ?? d);
+      this._live.reset(next, hass);
+      const current = this._hass;
+      if (current && current !== hass) this._live.append(current);
+      this._dataRefresh = true;
+      this._data = next;
+      this._statsDueAt = this._nextStatsDue(next, startedAt);
+      this._error = undefined;
+      this._reloadFailed = false;
+    } catch (e) {
+      if (seq !== this._loadSeq) return;
+      this._fail(e);
+    } finally {
+      this._partialDone();
+    }
+  }
+
+  private _partialDone(): void {
+    this._partial = undefined;
+    const gap = this._pendingGap;
+    this._pendingGap = undefined;
+    if (gap !== undefined && this.isConnected) void this._backfill(gap);
+  }
+
+  /** Live mode: next statistics refresh for `data` (Infinity without statistics series). */
+  private _nextStatsDue(data: SeriesData[], now: number): number {
+    const cfg = this._config;
+    if (!cfg || cfg.update.mode !== 'live' || !data.some((d) => d.source === 'statistics')) return Infinity;
+    return nextStatisticsRefresh(now, cfg.statisticsPeriod);
+  }
+
+  /** `update: <interval>`: a full reload is due. */
   private _reloadDue(now: number): boolean {
-    return this._loaded && now - this._loadedAt >= this._reloadEveryMs() - TIMER_SLACK_MS;
+    const cfg = this._config;
+    return !!cfg && cfg.update.mode === 'interval' && this._loaded && now - this._loadedAt >= cfg.update.intervalMs - TIMER_SLACK_MS;
   }
 
   // ---------------------------------------------------------------------------
@@ -449,16 +629,22 @@ export class EchartGraphCard extends LitElement {
   }
 
   private _onTick(): void {
-    if (!this.isConnected || document.hidden || !this._config || !this._hass) return;
-    if (this._reloadDue(Date.now())) {
-      void this._load();
-      return;
-    }
+    const cfg = this._config;
+    if (!this.isConnected || document.hidden || !cfg || !this._hass) return;
     if (!this._loaded || this._haveSig !== this._wantSig) {
-      this._maybeLoad(); // retry after a failed load
+      this._maybeLoad(); // initial load / config change, also retries a failed one
       return;
     }
     this._scheduleRedraw(2); // re-anchor window + trim
+    if ((this._hass as HassRuntimeExtras).connected === false) return; // wait for the reconnect
+    const now = Date.now();
+    if (this._reloadFailed) {
+      // Also after a failed reload of already loaded data (e.g. HA still starting after a reconnect).
+      if (now >= this._retryAt) void this._load();
+      return;
+    }
+    if (this._reloadDue(now)) void this._load();
+    else if (cfg.update.mode === 'live' && now >= this._statsDueAt) void this._refreshStatistics();
   }
 
   private readonly _onVisibilityChange = (): void => {
@@ -466,16 +652,21 @@ export class EchartGraphCard extends LitElement {
       this._hiddenAt ??= Date.now();
       return;
     }
-    const hiddenFor = this._hiddenAt === undefined ? 0 : Date.now() - this._hiddenAt;
+    const hiddenAt = this._hiddenAt;
     this._hiddenAt = undefined;
     const cfg = this._config;
     if (!cfg || !this._hass || !this.isConnected) return;
-    if (this._loaded && (this._reloadDue(Date.now()) || (cfg.update.mode !== 'none' && hiddenFor >= HIDDEN_STALE_MS))) {
-      void this._load();
+    if (!this._loaded) {
+      this._maybeLoad();
       return;
     }
-    this._maybeLoad();
-    if (this._loaded) this._scheduleRedraw(2);
+    this._scheduleRedraw(2);
+    if ((this._hass as HassRuntimeExtras).connected === false) return;
+    const now = Date.now();
+    if (this._reloadFailed ? now >= this._retryAt : this._reloadDue(now)) void this._load();
+    else if (cfg.update.mode === 'live' && hiddenAt !== undefined && now - hiddenAt >= HIDDEN_STALE_MS) this._catchUp(hiddenAt);
+    else if (cfg.update.mode === 'live' && now >= this._statsDueAt) void this._refreshStatistics();
+    else this._maybeLoad();
   };
 
   // ---------------------------------------------------------------------------
@@ -499,6 +690,7 @@ export class EchartGraphCard extends LitElement {
     this._chartInitFailed = false;
     this._chartEl = el;
     this._chart.on('legendselectchanged', this._onLegendSelectChanged);
+    this._chart.on('datazoom', this._onDataZoom);
     if (typeof ResizeObserver !== 'undefined') {
       this._ro = new ResizeObserver(() => this._scheduleResize());
       this._ro.observe(el);
@@ -513,6 +705,7 @@ export class EchartGraphCard extends LitElement {
     this._ro = undefined;
     if (this._chart) {
       this._chart.off('legendselectchanged', this._onLegendSelectChanged);
+      this._chart.off('datazoom', this._onDataZoom);
       if (!this._chart.isDisposed()) this._chart.dispose();
     }
     this._chart = undefined;
@@ -523,7 +716,13 @@ export class EchartGraphCard extends LitElement {
     if (this._resizeRaf !== undefined) return;
     this._resizeRaf = requestAnimationFrame(() => {
       this._resizeRaf = undefined;
-      if (this._chart && !this._chart.isDisposed()) this._chart.resize();
+      if (!this._chart || this._chart.isDisposed()) return;
+      this._chart.resize();
+      // Point reduction and tick count follow the size: rebuild after larger changes.
+      const [w, h] = this._builtSize;
+      const el = this._chartEl;
+      const changed = (a: number, b: number): boolean => (a > 0 ? Math.abs(b - a) / a > RESIZE_REBUILD_RATIO : b > 0);
+      if (el && (changed(w, el.clientWidth) || changed(h, el.clientHeight))) this._applyChart(false);
     });
   }
 
@@ -537,16 +736,20 @@ export class EchartGraphCard extends LitElement {
     return this._config?.update.mode === 'none' && this._loadedAt ? this._loadedAt : Date.now();
   }
 
-  /** Grid (sections) layout: fill the cell, unless the user sized the card by content. */
+  /**
+   * Grid (sections) layout: fill the cell only when the user gave it a fixed number of rows
+   * (like HA's history graph card); otherwise the card sizes to `height`.
+   */
   private _fillsCell(cfg: NormalizedConfig): boolean {
     if (this.layout !== 'grid') return false;
     const grid = (cfg.raw as { grid_options?: { rows?: unknown } }).grid_options;
-    return grid?.rows !== 'auto';
+    return typeof grid?.rows === 'number';
   }
 
   /**
    * Push the current state into ECharts. `full`: rebuild from scratch (notMerge) - config,
-   * theme or data change. Otherwise a cheap merge (replace series by id, lazy, no animation).
+   * theme or new dataset. Otherwise a cheap merge (series / y axes / visual maps replaced by id,
+   * lazy, no animation), which keeps the zoom window and an open tooltip.
    */
   private _applyChart(full: boolean): void {
     const chart = this._chart;
@@ -554,6 +757,8 @@ export class EchartGraphCard extends LitElement {
     const hass = this._hass;
     if (!chart || chart.isDisposed() || !cfg || !hass || !this._loaded) return;
     let option: EChartsCoreOption;
+    const width = this._chartEl?.clientWidth ?? 0;
+    const height = this._chartEl?.clientHeight ?? 0;
     try {
       option = buildOptions(cfg, this._data, this._currentTheme(), {
         hass,
@@ -561,16 +766,21 @@ export class EchartGraphCard extends LitElement {
         resolveColor: (c) => resolveColor(this, c),
         hiddenKeys: this._hiddenKeys,
         animate: full,
-        width: this._chartEl?.clientWidth || undefined,
+        width: width || undefined,
+        height: height || undefined,
+        zoom: this._zoom,
+        touch: this._touch,
+        zoomModifier: this._zoomModifier,
       });
     } catch (e) {
       this._error = `Could not render chart: ${errorMessage(e)}`;
       return;
     }
+    this._builtSize = [width, height];
     if (full) {
       chart.setOption(option, { notMerge: true });
     } else {
-      chart.setOption({ ...option, animation: false }, { replaceMerge: ['series'], lazyUpdate: true, silent: true });
+      chart.setOption({ ...option, animation: false }, { replaceMerge: ['series', 'yAxis', 'visualMap'], lazyUpdate: true, silent: true });
     }
   }
 
@@ -614,6 +824,40 @@ export class EchartGraphCard extends LitElement {
       this._chart.dispatchAction({ type: hide ? 'legendUnSelect' : 'legendSelect', name: legendNames(this._data)[i] });
     }
   };
+
+  // ---------------------------------------------------------------------------
+  // Zoom
+  // ---------------------------------------------------------------------------
+
+  /** Track the zoom window; re-reduce the visible range (finer points) once the gesture settles. */
+  private readonly _onDataZoom = (e: unknown): void => {
+    const ev = e as { start?: unknown; end?: unknown; batch?: Array<{ start?: unknown; end?: unknown }> } | undefined;
+    const b = ev?.batch?.[0] ?? ev;
+    const start = b?.start;
+    const end = b?.end;
+    if (typeof start !== 'number' || typeof end !== 'number') return;
+    this._zoom = start > 0.01 || end < 99.99 ? { start, end } : undefined;
+    if (this._zoomTimer !== undefined) clearTimeout(this._zoomTimer);
+    this._zoomTimer = setTimeout(() => {
+      this._zoomTimer = undefined;
+      this._applyChart(false);
+    }, ZOOM_DEBOUNCE_MS);
+  };
+
+  /** Ctrl enables wheel zoom (show.zoom, mouse): ECharts otherwise swallows page scrolling. */
+  private readonly _onKey = (e: KeyboardEvent): void => {
+    this._setZoomModifier(e.ctrlKey);
+  };
+
+  private readonly _onBlur = (): void => {
+    this._setZoomModifier(false);
+  };
+
+  private _setZoomModifier(pressed: boolean): void {
+    if (pressed === this._zoomModifier) return;
+    this._zoomModifier = pressed;
+    if (this._config?.show.zoom && !this._touch) this._applyChart(false);
+  }
 
   private readonly _onLegendSelectChanged = (e: unknown): void => {
     const selected = (e as { selected?: Record<string, boolean> } | undefined)?.selected;

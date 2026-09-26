@@ -2,7 +2,8 @@ import { css, html, nothing } from 'lit';
 import type { TemplateResult } from 'lit';
 import { styleMap } from 'lit/directives/style-map.js';
 import { formatValue } from './chart/format';
-import { isBinaryEntity, stateToNumber } from './data/history';
+import { isBinaryEntity, seriesValue } from './data/history';
+import { windowExtrema } from './data/reduce';
 import { transformValue } from './data/transform';
 import type {
   ColorThreshold,
@@ -79,6 +80,7 @@ export function thresholdColor(v: number | null | undefined, stops: readonly Col
 /**
  * Min / max / time-weighted average of the non-null values visible in [start, end].
  * Each value holds until the next point (sample-and-hold), the last one until `end`.
+ * Reference implementation (full scan); the header uses the cached windowExtrema.
  */
 export function computeExtrema(points: readonly Point[], start: number, end: number): Extrema | undefined {
   let min = Infinity;
@@ -105,6 +107,11 @@ export function computeExtrema(points: readonly Point[], start: number, end: num
   }
   if (count === 0) return undefined;
   return { min, max, avg: weight > 0 ? weighted / weight : sum / count };
+}
+
+/** Block length of the extrema cache: ~256 blocks per window, at least 1 s. */
+function extremaBlockMs(spanMs: number): number {
+  return Math.max(1000, Math.ceil(spanMs / 256));
 }
 
 function humanizeState(s: string): string {
@@ -148,7 +155,7 @@ function buildChip(
   } else {
     const rawValue: unknown = attr ? st.attributes[attr] : st.state;
     const binary = d?.isBinary ?? isBinaryEntity(entityId, st, attr);
-    const numeric = stateToNumber(rawValue);
+    const numeric = seriesValue(entityId, rawValue, attr);
     value = numeric === null ? null : transformValue(numeric, series.transform);
     if (value !== null && !binary && isNumericLike(rawValue)) {
       text = formatValue(value, unit, precision, hass.locale);
@@ -166,7 +173,8 @@ function buildChip(
 
   let extrema: ChipModel['extrema'];
   if (cfg.show.extrema && d && d.points.length > 0 && !d.isBinary) {
-    const e = computeExtrema(d.points, now - cfg.spanMs, now);
+    // Cached per points array: repeated renders of a live series only rescan its edges.
+    const e = windowExtrema(d.points, now - cfg.spanMs, now, extremaBlockMs(cfg.spanMs));
     if (e) {
       extrema = {
         min: formatValue(e.min, unit, precision, hass.locale),

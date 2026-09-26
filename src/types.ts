@@ -178,7 +178,11 @@ export interface SeriesConfig {
   name?: string;
   /** CSS color incl. `var(--x)`. Default: DEFAULT_PALETTE[index]. */
   color?: string;
-  /** Unit override. Default: entity `unit_of_measurement` (not used for `attribute` series: set `unit` there). */
+  /**
+   * Unit override. Default: entity `unit_of_measurement`; for `attribute` series only the
+   * temperature / humidity attributes of climate-like entities have a default (set `unit` for
+   * others, and whenever `transform` changes the unit).
+   */
   unit?: string;
   /** Explicit `y_axes[].id`. Default: auto axis by unit. */
   y_axis?: string;
@@ -197,7 +201,10 @@ export interface SeriesConfig {
   transform?: TransformConfig;
   /** Color the line by value (per-series visualMap). */
   color_thresholds?: ColorThreshold[];
-  /** Statistics column when data comes from long-term statistics. Default: auto (see NormalizedSeries.statistic). */
+  /**
+   * Statistics column. Setting it makes this series use long-term statistics regardless of the
+   * window / `data_source`. Default: auto (see NormalizedSeries.statistic).
+   */
   statistic?: StatisticType;
   /** Decimals for header/tooltip. Default: entity display_precision, else auto. */
   precision?: number;
@@ -215,11 +222,18 @@ export interface CardConfig {
   hours_to_show?: number | string;
   /** Window length as a duration (`"7d"`); bare numbers are hours. Takes precedence over `hours_to_show`. */
   span?: DurationInput;
-  /** Chart height. Number = px, string = any CSS length. Default `220px`. */
+  /**
+   * Chart height. Number = px, string = an absolute or viewport CSS length (`250px`, `15rem`,
+   * `30vh`). Default `220px`. In the sections layout the card fills its grid cell only when
+   * `grid_options.rows` is a number; otherwise this height applies there too.
+   */
   height?: string | number;
   /** Default `auto`. */
   data_source?: DataSource;
-  /** Default: span <= 2d -> `5minute`, <= 31d -> `hour`, else `day`. */
+  /**
+   * Default: span <= 2d -> `5minute`, <= 31d -> `hour`, else `day`. Setting it with
+   * `data_source: auto` makes the card use long-term statistics for any window.
+   */
   statistics_period?: StatisticsPeriod;
   /**
    * `live` (default): append points from hass.states changes, refetch every 5 min.
@@ -337,14 +351,22 @@ export interface NormalizedThreshold {
 export interface NormalizedUpdate {
   mode: UpdateMode;
   /**
-   * `interval`: refetch period. `live`: periodic full refetch / window re-anchor period
-   * (default 300000 = 5 min). `none`: 0.
+   * `interval`: refetch period. `live`: 300000 (5 min, kept for reference; in live mode the card
+   * refreshes statistics series right after each statistics period has been compiled and never
+   * refetches history). `none`: 0.
    */
   intervalMs: number;
 }
 
 export interface NormalizedShow {
   legend: boolean;
+  /**
+   * Keys of the series listed in the legend. Default legend: only the series the header chips do
+   * not cover (not in the header, or the single hero value, which has no toggle), so chips and
+   * legend together make every series toggleable. `show.legend: true` or `header_states: false`:
+   * every series.
+   */
+  legendKeys: string[];
   tooltip: boolean;
   headerStates: boolean;
   zoom: boolean;
@@ -361,7 +383,10 @@ export interface NormalizedConfig {
   spanMs: number;
   /** CSS length, e.g. `'220px'`. */
   height: string;
-  /** Resolved source (auto -> history if spanMs <= 72h else statistics). */
+  /**
+   * Resolved card-level source (auto -> history if spanMs <= 72h and no statistics_period is
+   * configured, else statistics). Series may still differ (see the loader's plannedSource).
+   */
   dataSource: 'history' | 'statistics';
   /** True when the user did not force a source; the loader may then fall back statistics -> history per series. */
   dataSourceAuto: boolean;
@@ -375,6 +400,11 @@ export interface NormalizedConfig {
   series: NormalizedSeries[];
   /** The original config object (for getCardSize/getGridOptions heuristics, debugging). */
   raw: CardConfig;
+  /**
+   * Non-fatal problems (unknown / ignored options, with hints for apexcharts-card and
+   * mini-graph-card keys). Shown inside the card.
+   */
+  warnings: string[];
 }
 
 // ---------------------------------------------------------------------------

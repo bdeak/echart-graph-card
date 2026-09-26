@@ -83,10 +83,28 @@ const PERIODS: readonly StatisticsPeriod[] = ['5minute', 'hour', 'day', 'week', 
 
 const iso = (t: number): string => new Date(t).toISOString();
 
-/** The few frontend translations the card may ask for (`hass.localize`). */
+/** Translated states per domain (subset of HA's `component.<domain>.entity_component._.state`). */
+const DOMAIN_STATES: Record<string, Record<string, string>> = {
+  binary_sensor: { on: 'On', off: 'Off' },
+  switch: { on: 'On', off: 'Off' },
+  light: { on: 'On', off: 'Off' },
+  fan: { on: 'On', off: 'Off' },
+  input_boolean: { on: 'On', off: 'Off' },
+  automation: { on: 'On', off: 'Off' },
+  cover: { open: 'Open', closed: 'Closed', opening: 'Opening', closing: 'Closing' },
+  lock: { locked: 'Locked', unlocked: 'Unlocked', locking: 'Locking', unlocking: 'Unlocking', jammed: 'Jammed', open: 'Open', opening: 'Opening' },
+  person: { home: 'Home', not_home: 'Away' },
+  device_tracker: { home: 'Home', not_home: 'Away' },
+  climate: { off: 'Off', heat: 'Heat', cool: 'Cool', auto: 'Auto', heat_cool: 'Heat/Cool', dry: 'Dry', fan_only: 'Fan only' },
+};
+
+/** The frontend translations the card may ask for (`hass.localize`). */
 const TRANSLATIONS: Record<string, string> = {
-  'component.binary_sensor.entity_component._.state.on': 'On',
-  'component.binary_sensor.entity_component._.state.off': 'Off',
+  ...Object.fromEntries(
+    Object.entries(DOMAIN_STATES).flatMap(([domain, states]) =>
+      Object.entries(states).map(([state, text]) => [`component.${domain}.entity_component._.state.${state}`, text]),
+    ),
+  ),
   'state.default.unavailable': 'Unavailable',
   'state.default.unknown': 'Unknown',
 };
@@ -102,7 +120,11 @@ const BINARY_STATE_NAMES: Record<string, [string, string]> = {
   moisture: ['Dry', 'Wet'],
 };
 
-/** Minimal `hass.formatEntityState`: translated binary states, else the state humanized. */
+/**
+ * Minimal `hass.formatEntityState` with HA's fallback rules: device-class / domain translations,
+ * numbers with their unit, and otherwise the RAW state (HA shows untranslated states as is, e.g.
+ * `formatEntityState(cover, 'on')` is "on").
+ */
 function formatEntityState(stateObj: HassEntityState, state?: string): string {
   const s = state ?? stateObj.state;
   if (s === 'unavailable' || s === 'unknown') return TRANSLATIONS[`state.default.${s}`];
@@ -111,11 +133,15 @@ function formatEntityState(stateObj: HassEntityState, state?: string): string {
     const names = BINARY_STATE_NAMES[String(stateObj.attributes.device_class ?? '')] ?? ['Off', 'On'];
     return names[s === 'on' ? 1 : 0];
   }
+  const translated = DOMAIN_STATES[domain]?.[s];
+  if (translated) return translated;
   const unit = stateObj.attributes.unit_of_measurement;
   if (s.trim() !== '' && Number.isFinite(Number(s))) return unit ? `${s} ${unit}` : s;
-  const t = s.replace(/_/g, ' ');
-  return t.charAt(0).toUpperCase() + t.slice(1);
+  return s;
 }
+
+/** HA's `valid_entity_id`: history requests with a malformed unknown id are rejected as a whole. */
+const VALID_ENTITY_ID = /^(?!.+__)(?!_)[\da-z_]+(?<!_)\.(?!_)[\da-z_]+(?<!_)$/;
 
 function haError(code: string, message: string): HaError {
   return { code, message };
@@ -371,6 +397,9 @@ export class MockHassController {
     const start = parseTime(msg.start_time, 'start_time');
     const end = Math.min(msg.end_time === undefined ? now : parseTime(msg.end_time, 'end_time'), now);
     if (!Array.isArray(msg.entity_ids) || msg.entity_ids.length === 0) throw haError('invalid_format', 'entity_ids is required');
+    for (const id of msg.entity_ids as unknown[]) {
+      if (typeof id !== 'string' || (!this.byId.has(id) && !VALID_ENTITY_ID.test(id))) throw haError('invalid_entity_ids', 'Invalid entity_ids');
+    }
     const minimal = msg.minimal_response === true;
     const noAttributes = msg.no_attributes === true;
     const out: HistoryResponse = {};

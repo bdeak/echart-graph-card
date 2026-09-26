@@ -137,9 +137,29 @@ describe('normalizeConfig: defaults', () => {
 
   it('shows the legend by default only for multi-series cards without header states', () => {
     expect(cfg({ series: ['sensor.a', 'sensor.b'] }).show.legend).toBe(false);
-    expect(cfg({ series: ['sensor.a', 'sensor.b'], show: { header_states: false } }).show.legend).toBe(true);
+    expect(cfg({ series: ['sensor.a', 'sensor.b'], show: { header_states: false } }).show).toMatchObject({
+      legend: true,
+      legendKeys: ['0:sensor.a', '1:sensor.b'],
+    });
     expect(cfg({ series: ['sensor.a'], show: { header_states: false } }).show.legend).toBe(false);
     expect(cfg({ series: ['sensor.a'], show: { legend: true } }).show.legend).toBe(true);
+  });
+
+  it('lists series the header cannot toggle in the legend by default', () => {
+    // Setpoint has no chip: legend with just the setpoint.
+    const chips2 = cfg({ series: ['sensor.a', 'sensor.b', { entity: 'sensor.c', show_in_header: false }] }).show;
+    expect(chips2).toMatchObject({ legend: true, legendKeys: ['2:sensor.c'] });
+    // A single hero chip has no toggle: once a legend is needed it lists the hero series too.
+    const hero = cfg({ series: ['sensor.a', { entity: 'sensor.b', show_in_header: false }] }).show;
+    expect(hero).toMatchObject({ legend: true, legendKeys: ['0:sensor.a', '1:sensor.b'] });
+    // A hidden hero series could never be shown otherwise.
+    expect(cfg({ series: [{ entity: 'sensor.a', hidden: true }] }).show).toMatchObject({ legend: true, legendKeys: ['0:sensor.a'] });
+    // A lone chip-less series needs no legend (nothing to toggle), unless it starts hidden.
+    expect(cfg({ series: [{ entity: 'sensor.a', show_in_header: false }] }).show.legend).toBe(false);
+    expect(cfg({ series: [{ entity: 'sensor.a', show_in_header: false, hidden: true }] }).show.legend).toBe(true);
+    // Explicit settings win; an explicit legend lists every series.
+    expect(cfg({ series: ['sensor.a', { entity: 'sensor.c', show_in_header: false }], show: { legend: false } }).show.legend).toBe(false);
+    expect(cfg({ series: ['sensor.a', 'sensor.b'], show: { legend: true } }).show.legendKeys).toEqual(['0:sensor.a', '1:sensor.b']);
   });
 
   it('gives binary entities thin, straight lines unless configured', () => {
@@ -164,6 +184,41 @@ describe('normalizeConfig: defaults', () => {
 
   it('accepts external statistic ids', () => {
     expect(cfg({ series: ['tibber:energy_consumption_home'] }).series[0].entity).toBe('tibber:energy_consumption_home');
+    expect(cfg({ series: ['sensor.a_1', 'binary_sensor.door_2'] }).series).toHaveLength(2);
+  });
+
+  it('warns about unknown options, with hints for apexcharts / mini-graph-card keys', () => {
+    const c = cfg({
+      graph_span: '2h',
+      grid_options: { rows: 4 },
+      visibility: [],
+      card_mod: {},
+      view_layout: {},
+      show: { labels: true },
+      y_axes: [{ id: 'p', opposite: true }],
+      thresholds: [{ value: 1, y: 2 }],
+      group_by: { func: 'avg', duration: '5m', fill: 'last' },
+      update: { interval: '60s', every: 1 },
+      series: [
+        { entity: 'sensor.a', stroke_width: 3, yaxis_id: 'p', line: { width: 2, dash: 'x' }, transform: { multiply: 2, divide: 3 }, foo: 1 },
+        { entity: 'sensor.b', color_thresholds: [{ value: 1, color: 'red', opacity: 1 }] },
+      ],
+    } as unknown as Omit<CardConfig, 'type'>);
+    expect(c.warnings).toEqual([
+      'Unknown option "graph_span" is ignored (use span)',
+      'Unknown option "y_axes[0].opposite" is ignored (use position: right)',
+      'Unknown option "group_by.fill" is ignored (not needed, empty buckets repeat the held value)',
+      'Unknown option "series[0].stroke_width" is ignored (use line.width)',
+      'Unknown option "series[0].yaxis_id" is ignored (use y_axis)',
+      'Unknown option "series[0].foo" is ignored',
+      'Unknown option "series[0].line.dash" is ignored (use style)',
+      'Unknown option "series[0].transform.divide" is ignored',
+      'Unknown option "series[1].color_thresholds[0].opacity" is ignored',
+      'Unknown option "update.every" is ignored',
+      'Unknown option "show.labels" is ignored (use show.y_axis)',
+      'Unknown option "thresholds[0].y" is ignored (use value)',
+    ]);
+    expect(cfg({ series: ['sensor.a'] }).warnings).toEqual([]);
   });
 
   it('stringifies numeric names/titles/units', () => {
@@ -202,6 +257,17 @@ describe('normalizeConfig: window and data source', () => {
     expect(cfg({ height: 300 }).height).toBe('300px');
     expect(cfg({ height: '300' }).height).toBe('300px');
     expect(cfg({ height: ' 20vh ' }).height).toBe('20vh');
+    expect(cfg({ height: '15rem' }).height).toBe('15rem');
+    expect(cfg({ height: '180PX' }).height).toBe('180px');
+    expect(cfg({ height: '12.5em' }).height).toBe('12.5em');
+  });
+
+  it('an explicit statistics_period makes auto use statistics; ignored options are reported', () => {
+    expect(cfg({ span: '24h', statistics_period: 'hour' })).toMatchObject({ dataSource: 'statistics', dataSourceAuto: true, statisticsPeriod: 'hour' });
+    expect(cfg({ span: '24h' }).dataSource).toBe('history');
+    expect(cfg({ data_source: 'history', statistics_period: 'hour' }).warnings).toEqual(['statistics_period is ignored with data_source: history']);
+    // ...unless a series uses statistics anyway (explicit column / external statistic).
+    expect(cfg({ data_source: 'history', statistics_period: 'hour', series: [{ entity: 'sensor.w', statistic: 'change' }] }).warnings).toEqual([]);
   });
 
   it('normalizes update modes', () => {
@@ -304,7 +370,24 @@ describe('normalizeConfig: friendly errors', () => {
     [{ series: ['sensor.a'], data_source: 'cloud' }, /data_source must be one of auto, history, statistics \(got "cloud"\)/],
     [{ series: ['sensor.a'], statistics_period: 'year' }, /statistics_period must be one of/],
     [{ series: ['sensor.a'], update: '1s' }, /update must be at least 5s/],
-    [{ series: ['sensor.a'], update: true }, /update must be a duration/],
+    [{ series: ['sensor.a'], update: true }, /update must be live, none or a refresh interval like "60s" \(got true\)/],
+    [{ series: ['sensor.a'], update: 'always' }, /update must be live, none or a refresh interval like "60s" \(got "always"\)/],
+    [{ series: ['sensor.a'], update: { interval: 'soon' } }, /update\.interval must be a duration like "60s" \(got "soon"\)/],
+    [{ series: ['sensor.Living_Room'] }, /series\[0\]\.entity "sensor\.Living_Room" is not a valid entity id \(did you mean "sensor\.living_room"\?\)/],
+    [{ series: ['sensor.living-room'] }, /did you mean "sensor\.living_room"/],
+    [{ series: ['sensor.a.b'] }, /"sensor\.a\.b" is not a valid entity id/],
+    [{ series: ['sensor._a'] }, /"sensor\._a" is not a valid entity id \(did you mean "sensor\.a"\?\)/],
+    [{ entities: ['Sensor.A'] }, /entities\[0\]\.entity "Sensor\.A" is not a valid entity id/],
+    [{ series: [{ entity: 'tibber:consumption', attribute: 'x' }] }, /series\[0\]\.attribute cannot be used with the external statistic/],
+    [{ series: [{ entity: 'climate.a', attribute: 'temperature', statistic: 'mean' }] }, /series\[0\]\.statistic cannot be combined with attribute/],
+    [{ series: ['sensor.a'], y_axes: [{ id: 'p', min: '~-3000' }] }, /y_axes\[0\]\.min must be a number \(got "~-3000"\); for a soft bound use soft_min: -3000/],
+    [{ series: ['sensor.a'], y_axes: [{ id: 'p', max: '~5000' }] }, /for a soft bound use soft_max: 5000/],
+    [{ series: ['sensor.a'], height: '250 px' }, /height must be a CSS length like "250px", "15rem" or "30vh" \(got "250 px"\); % and auto are not supported/],
+    [{ series: ['sensor.a'], height: '50%' }, /height must be a CSS length/],
+    [{ series: ['sensor.a'], height: 'auto' }, /height must be a CSS length/],
+    [{ series: ['sensor.a'], height: 'big' }, /height must be a CSS length/],
+    [{ series: ['sensor.a'], height: '0px' }, /height must be a CSS length/],
+    [{ series: ['sensor.a'], height: '0' }, /height must be a positive number/],
     [{ series: ['sensor.a'], height: -5 }, /height must be a positive number/],
     [{ series: ['sensor.a'], show: 'yes' }, /show must be an object/],
     [{ series: ['sensor.a'], show: { zoom: 'yes' } }, /show\.zoom must be true or false/],
