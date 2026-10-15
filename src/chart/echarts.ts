@@ -2,7 +2,7 @@
  * Tree-shaken ECharts build: only what a time-series line card needs.
  * Import `echarts` from here (never from 'echarts' directly) so the bundle stays small.
  *
- * Registered: LineChart, Grid (value/time axes), Tooltip (+ AxisPointer), Legend (plain +
+ * Registered: LineChart, BarChart (`type: bar` series), Grid (value/time axes), Tooltip (+ AxisPointer), Legend (plain +
  * scroll), DataZoom *inside* only (no slider), MarkLine, MarkArea, MarkPoint (show.extrema),
  * VisualMap *piecewise* only (use piecewise pieces for color_thresholds), CanvasRenderer.
  * Deliberately NOT registered (bundle cost): DataZoom slider, continuous VisualMap,
@@ -14,8 +14,8 @@
  */
 import { dispose, getInstanceByDom, graphic, init, use } from 'echarts/core';
 import type { ComposeOption, ECharts, EChartsCoreOption, SetOptionOpts } from 'echarts/core';
-import { LineChart } from 'echarts/charts';
-import type { LineSeriesOption } from 'echarts/charts';
+import { BarChart, LineChart } from 'echarts/charts';
+import type { BarSeriesOption, LineSeriesOption } from 'echarts/charts';
 import {
   DataZoomInsideComponent,
   GridComponent,
@@ -40,6 +40,7 @@ import { CanvasRenderer } from 'echarts/renderers';
 
 use([
   LineChart,
+  BarChart,
   GridComponent,
   TooltipComponent,
   LegendComponent,
@@ -54,6 +55,7 @@ use([
 /** Type-safe option composed from exactly the registered parts (assignable to EChartsCoreOption). */
 export type ECOption = ComposeOption<
   | LineSeriesOption
+  | BarSeriesOption
   | GridComponentOption
   | TooltipComponentOption
   | LegendComponentOption
@@ -65,7 +67,7 @@ export type ECOption = ComposeOption<
 >;
 
 export type EChartsInstance = ECharts;
-export type { EChartsCoreOption, LineSeriesOption, SetOptionOpts };
+export type { BarSeriesOption, EChartsCoreOption, LineSeriesOption, SetOptionOpts };
 
 /** The registered ECharts runtime API used by the card. */
 export const echarts = { init, dispose, getInstanceByDom, graphic } as const;

@@ -29,6 +29,8 @@ export interface HeaderOptions {
   onMoreInfo?: (entityId: string) => void;
   /** Epoch ms used as the right edge of the window for extrema. Default Date.now(). */
   now?: number;
+  /** Epoch ms of the window start (extrema). Default `now - cfg.spanMs`. */
+  start?: number;
 }
 
 /** Optional formatters present on modern `hass` objects (not part of the shared contract). */
@@ -124,6 +126,16 @@ function isNumericLike(v: unknown): boolean {
   return typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v));
 }
 
+/** Value of the point at or before `t` (the bucket / list item covering it). */
+function pointValueAt(points: readonly Point[], t: number): number | null | undefined {
+  let v: number | null | undefined;
+  for (const p of points) {
+    if (p[0] > t) break;
+    v = p[1];
+  }
+  return v;
+}
+
 function buildChip(
   series: NormalizedSeries,
   d: SeriesData | undefined,
@@ -131,6 +143,7 @@ function buildChip(
   cfg: NormalizedConfig,
   hidden: boolean,
   now: number,
+  start: number,
 ): ChipModel {
   const entityId = series.entity;
   const st: HassEntityState | undefined = hass.states[entityId];
@@ -146,7 +159,13 @@ function buildChip(
   let number: string;
   let heroUnit: string | undefined;
 
-  if (!st) {
+  if (series.valueKey !== undefined) {
+    // List attribute: the item covering now (the attribute itself is a list, not a value).
+    value = st ? (d ? (pointValueAt(d.points, now) ?? null) : null) : undefined;
+    text = formatValue(value, unit, precision, hass.locale);
+    number = formatValue(value, undefined, precision, hass.locale);
+    heroUnit = value === null || value === undefined ? undefined : unit;
+  } else if (!st) {
     // External statistic (`source:id`) or unknown entity: use the loader's value if any.
     value = d?.latest;
     text = formatValue(value, unit, precision, hass.locale);
@@ -174,7 +193,7 @@ function buildChip(
   let extrema: ChipModel['extrema'];
   if (cfg.show.extrema && d && d.points.length > 0 && !d.isBinary) {
     // Cached per points array: repeated renders of a live series only rescan its edges.
-    const e = windowExtrema(d.points, now - cfg.spanMs, now, extremaBlockMs(cfg.spanMs));
+    const e = windowExtrema(d.points, start, now, extremaBlockMs(cfg.spanMs));
     if (e) {
       extrema = {
         min: formatValue(e.min, unit, precision, hass.locale),
@@ -281,13 +300,14 @@ export function renderHeader(
   void theme; // Colors come from HA CSS variables directly; kept for API symmetry.
   const hiddenKeys = opts.hiddenKeys ?? new Set(cfg.series.filter((s) => s.hidden).map((s) => s.key));
   const now = opts.now ?? Date.now();
+  const start = opts.start ?? now - cfg.spanMs;
 
   const chips: ChipModel[] = cfg.show.headerStates
     ? cfg.series
         .filter((s) => s.showInHeader)
         .map((s) => {
           const d = data[s.index]?.series.key === s.key ? data[s.index] : undefined;
-          return buildChip(s, d, hass, cfg, hiddenKeys.has(s.key), now);
+          return buildChip(s, d, hass, cfg, hiddenKeys.has(s.key), now, start);
         })
     : [];
 

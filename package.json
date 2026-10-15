@@ -1,6 +1,6 @@
 {
   "name": "echart-graph-card",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Fast, beautiful time-series line charts for Home Assistant Lovelace, powered by Apache ECharts.",
   "type": "module",
   "license": "MIT",

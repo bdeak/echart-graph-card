@@ -1,0 +1,60 @@
+# Today's solar production per hour with the Solcast forecast (P10 / P50 / P90) on top.
+# The window is today 00:00-24:00 (span.start: day), so the forecast for the rest of the day
+# is visible. Bars: hourly change of the inverter's daily counter from 5-minute statistics,
+# summed per hour (the current hour fills in every 5 minutes). Forecast lines: Solcast's
+# detailedForecast attribute (average kW per half hour), averaged per hour = kWh per hour.
+type: custom:echart-graph-card
+title: Solar production
+span:
+  start: day
+data_source: statistics
+statistics_period: 5minute
+y_axes:
+  - id: energy
+    unit: kWh
+    min: 0
+series:
+  - entity: sensor.growatt_min_3000_tl_x_growatt_today_s_power_generation
+    name: Solar
+    type: bar
+    statistic: change
+    group_by: { func: sum, duration: 1h }
+    y_axis: energy
+    color: "#FF9800"
+    precision: 1
+  - entity: sensor.solcast_pv_forecast_forecast_today
+    name: Forecast
+    attribute: detailedForecast
+    value_key: pv_estimate
+    group_by: { func: avg, duration: 1h }
+    unit: kWh
+    y_axis: energy
+    color: var(--primary-text-color)   # white-ish on dark themes, dark on light ones
+    line: { style: dashed, width: 1.5 }
+    fill: none
+    precision: 2
+    show_in_header: false
+  - entity: sensor.solcast_pv_forecast_forecast_today
+    name: P10
+    attribute: detailedForecast
+    value_key: pv_estimate10
+    group_by: { func: avg, duration: 1h }
+    unit: kWh
+    y_axis: energy
+    color: "#64B5F6"
+    line: { style: dotted, width: 1.5 }
+    fill: none
+    precision: 2
+    show_in_header: false
+  - entity: sensor.solcast_pv_forecast_forecast_today
+    name: P90
+    attribute: detailedForecast
+    value_key: pv_estimate90
+    group_by: { func: avg, duration: 1h }
+    unit: kWh
+    y_axis: energy
+    color: "#81C784"
+    line: { style: dotted, width: 1.5 }
+    fill: none
+    precision: 2
+    show_in_header: false

@@ -18,6 +18,8 @@ import type {
   NormalizedUpdate,
   NormalizedYAxis,
   SeriesConfig,
+  SeriesType,
+  SpanStart,
   StatisticType,
   StatisticsPeriod,
   StepMode,
@@ -49,6 +51,9 @@ export const DEFAULTS = {
   solidOpacity: 0.2,
   thresholdLineOpacity: 0.8,
   thresholdAreaOpacity: 0.12,
+  /** Bars: fill opacity (solid and gradient) and border width. */
+  barOpacity: 0.45,
+  barBorderWidth: 1,
 } as const;
 
 export const GROUP_BY_FUNCS: readonly GroupByFunc[] = ['avg', 'min', 'max', 'first', 'last', 'sum', 'delta', 'median'];
@@ -57,6 +62,8 @@ export const LINE_STYLES: readonly LineStyle[] = ['solid', 'dashed', 'dotted'];
 export const DATA_SOURCES: readonly DataSource[] = ['auto', 'history', 'statistics'];
 export const STATISTICS_PERIODS: readonly StatisticsPeriod[] = ['5minute', 'hour', 'day', 'week', 'month'];
 export const STATISTIC_TYPES: readonly StatisticType[] = ['mean', 'min', 'max', 'sum', 'state', 'change'];
+export const SERIES_TYPES: readonly SeriesType[] = ['line', 'bar'];
+export const SPAN_STARTS: readonly SpanStart[] = ['day'];
 
 // ---------------------------------------------------------------------------
 // Duration parsing
@@ -252,6 +259,9 @@ const KNOWN = {
     'unit',
     'y_axis',
     'attribute',
+    'value_key',
+    'time_key',
+    'type',
     'line',
     'fill',
     'fill_opacity',
@@ -264,6 +274,7 @@ const KNOWN = {
     'hidden',
   ],
   show: ['legend', 'tooltip', 'header_states', 'zoom', 'extrema', 'points', 'x_axis', 'y_axis'],
+  span: ['start', 'duration'],
   yAxis: ['id', 'unit', 'name', 'min', 'max', 'soft_min', 'soft_max', 'position', 'precision', 'show'],
   threshold: ['value', 'from', 'to', 'color', 'style', 'width', 'opacity', 'label', 'y_axis'],
   line: ['width', 'smooth', 'step', 'style'],
@@ -282,8 +293,8 @@ const HINTS: Record<keyof typeof KNOWN, Record<string, string>> = {
     yaxis: 'use y_axes',
     all_series_config: 'set the options per series; group_by can also be set for the whole card',
     apex_config: 'not supported; use thresholds for reference lines and bands',
-    chart_type: 'only line charts are supported',
-    now: 'not supported; the window always ends now',
+    chart_type: 'set type: bar on the series',
+    now: 'not supported; the window ends now, or use span: { start: day }',
     stacked: 'not supported',
     points_per_hour: 'use group_by, e.g. group_by: 10m',
     aggregate_func: 'use group_by: { func, duration }',
@@ -306,17 +317,20 @@ const HINTS: Record<keyof typeof KNOWN, Record<string, string>> = {
     float_precision: 'use precision',
     color_threshold: 'use color_thresholds',
     invert: 'use transform: { multiply: -1 }',
-    type: 'use fill: gradient, solid or none (column charts are not supported)',
     extend_to: 'not needed, history lines always extend to now',
     statistics: 'use data_source / statistics_period on the card and statistic on the series',
     opacity: 'use fill_opacity',
     show: 'use show_in_header or hidden',
     offset: 'not supported',
-    data_generator: 'not supported (no JavaScript)',
+    data_generator: 'not supported (no JavaScript); list attributes can be plotted with attribute + value_key',
     smoothing: 'use line.smooth',
     state_adaptive_color: 'not supported',
     yaxis: 'use y_axis',
     multiply: 'use transform: { multiply }',
+  },
+  span: {
+    end: 'not supported; the window always starts at the aligned start',
+    offset: 'not supported',
   },
   show: {
     labels: 'use show.y_axis',
@@ -490,10 +504,40 @@ function normalizeThresholds(v: unknown, axes: NormalizedYAxis[], ctx: Ctx): Nor
   });
 }
 
+function normalizeSeriesType(v: unknown, path: string): SeriesType {
+  if (v === undefined || v === null) return 'line';
+  if (v === 'column') return 'bar';
+  if (v === 'area') fail(path, 'area is not a series type; use type: line (the default) with fill: solid or gradient');
+  return optEnum(v, SERIES_TYPES, path) ?? 'line';
+}
+
+/** `span`: a duration, or `{ start: day, duration? }` (duration default: `hours_to_show`, else 24h). */
+function normalizeSpan(cfg: Obj, ctx: Ctx): { spanMs: number; spanStart: SpanStart | null } {
+  const hours = cfg.hours_to_show;
+  const fallback = (): number => (hours !== undefined && hours !== null ? duration(hours, 'hours_to_show', HOUR) : DEFAULTS.spanMs);
+  let spanMs: number;
+  let spanStart: SpanStart | null = null;
+  let path = cfg.span !== undefined && cfg.span !== null ? 'span' : 'hours_to_show';
+  if (isObj(cfg.span)) {
+    checkKeys(cfg.span, 'span', 'span', ctx);
+    if (cfg.span.start === undefined || cfg.span.start === null) fail('span.start', `is required (${SPAN_STARTS.join(', ')})`);
+    spanStart = optEnum(cfg.span.start, SPAN_STARTS, 'span.start') ?? null;
+    const d = cfg.span.duration;
+    if (d !== undefined && d !== null) {
+      spanMs = duration(d, 'span.duration', HOUR);
+      path = 'span.duration';
+    } else spanMs = fallback();
+  } else if (cfg.span !== undefined && cfg.span !== null) spanMs = duration(cfg.span, 'span', HOUR);
+  else spanMs = fallback();
+  if (spanMs <= 0) fail(path, 'must be > 0');
+  return { spanMs: Math.round(spanMs), spanStart };
+}
+
 function normalizeSeries(
   rawList: Array<SeriesConfig | string>,
   axes: NormalizedYAxis[],
   cardGroupBy: NormalizedGroupBy | null,
+  dataSource: 'history' | 'statistics',
   ctx: Ctx,
   seriesKey: string,
 ): NormalizedSeries[] {
@@ -513,6 +557,13 @@ function normalizeSeries(
     if (attribute !== undefined && statistic !== 'auto') {
       fail(`${path}.statistic`, 'cannot be combined with attribute (long-term statistics only exist for states)');
     }
+    const valueKey = optText(s.value_key, `${path}.value_key`);
+    const timeKey = optText(s.time_key, `${path}.time_key`);
+    if (valueKey !== undefined && attribute === undefined) {
+      fail(`${path}.value_key`, 'needs attribute: the list attribute to read (e.g. attribute: detailedForecast)');
+    }
+    if (timeKey !== undefined && valueKey === undefined) fail(`${path}.time_key`, 'only applies together with value_key');
+    const type = normalizeSeriesType(s.type, `${path}.type`);
     const unit = optText(s.unit, `${path}.unit`);
 
     let yAxis = checkAxisRef(optString(s.y_axis, `${path}.y_axis`), axes, `${path}.y_axis`);
@@ -520,6 +571,8 @@ function normalizeSeries(
 
     const line = normalizeLine(s.line, `${path}.line`, ctx);
     const rawLine = isObj(s.line) ? s.line : {};
+    // Bars: line.width is the border width.
+    if (type === 'bar' && (rawLine.width === undefined || rawLine.width === null)) line.width = DEFAULTS.barBorderWidth;
     if (!attribute && BINARY_DOMAINS.includes(entity.split('.')[0])) {
       // on/off entities: thinner, straight (they render as step lines).
       if (rawLine.width === undefined || rawLine.width === null) line.width = DEFAULTS.binaryLineWidth;
@@ -530,12 +583,15 @@ function normalizeSeries(
     // Value-coloured lines (>= 2 stops) default to no fill: an area would inherit the stops as
     // horizontal colour bands, which reads like threshold bands and muddies the chart.
     const autoFill = count <= DEFAULTS.autoFillMaxSeries && colorThresholds.length < 2;
-    const fill = optEnum(s.fill, FILL_MODES, `${path}.fill`) ?? (autoFill ? 'gradient' : 'none');
+    const fill = optEnum(s.fill, FILL_MODES, `${path}.fill`) ?? (type === 'bar' ? 'solid' : autoFill ? 'gradient' : 'none');
     const fillOpacity =
       optNumber(s.fill_opacity, `${path}.fill_opacity`, { min: 0, max: 1 }) ??
-      (fill === 'solid' ? DEFAULTS.solidOpacity : fill === 'gradient' ? DEFAULTS.gradientOpacity : 0);
+      (fill === 'none' ? 0 : type === 'bar' ? DEFAULTS.barOpacity : fill === 'solid' ? DEFAULTS.solidOpacity : DEFAULTS.gradientOpacity);
 
     const groupBy = s.group_by === undefined ? cardGroupBy : normalizeGroupBy(s.group_by, `${path}.group_by`, ctx);
+    if (type === 'bar' && !groupBy && statistic === 'auto' && valueKey === undefined && !isExternalStatistic(entity) && dataSource === 'history') {
+      ctx.warnings.push(`${path}: bars of raw history have no bucket width; set group_by (e.g. 1h) or a statistic (e.g. change)`);
+    }
 
     if (s.transform !== undefined && s.transform !== null && !isObj(s.transform)) fail(`${path}.transform`, 'must be { multiply, offset }');
     const tr = (s.transform ?? {}) as Obj;
@@ -543,9 +599,12 @@ function normalizeSeries(
 
     return {
       index,
-      key: `${index}:${entity}${attribute ? `#${attribute}` : ''}`,
+      key: `${index}:${entity}${attribute ? `#${attribute}` : ''}${valueKey !== undefined ? `[${valueKey}]` : ''}`,
       entity,
       attribute,
+      valueKey,
+      timeKey,
+      type,
       name: optText(s.name, `${path}.name`),
       color: optString(s.color, `${path}.color`) ?? DEFAULT_PALETTE[index % DEFAULT_PALETTE.length],
       unit,
@@ -657,6 +716,11 @@ function defaultStatisticsPeriod(spanMs: number): StatisticsPeriod {
  * - Window: `span` wins over `hours_to_show`; default 24h. Both accept a number of HOURS or a
  *   duration string (`"36h"`, `"7d"`). Duration rule everywhere: strings carry their unit;
  *   bare numbers are hours for `span`/`hours_to_show` and seconds for `group_by`/`update`.
+ *   `span: { start: day, duration? }` aligns the window to local midnight (spanStart); its length
+ *   is `duration`, else `hours_to_show`, else 24h.
+ * - Series `type`: line (default) | bar (`column` alias). Bars default to a solid fill at 0.45
+ *   and a 1px border (`line.width`); raw-history bars without group_by get a warning.
+ * - `value_key` (needs `attribute`) makes a list attribute series; `time_key` needs `value_key`.
  * - `data_source: auto` -> `history` when spanMs <= 72h and no `statistics_period` is set, else
  *   `statistics` (dataSourceAuto = true). A series with an explicit `statistic` (or an external
  *   `source:id`) always uses statistics.
@@ -690,12 +754,7 @@ export function normalizeConfig(raw: CardConfig): NormalizedConfig {
     fail(seriesKey, 'must be a non-empty list, e.g.\nseries:\n  - entity: sensor.temperature');
   }
 
-  let spanMs: number;
-  if (cfg.span !== undefined && cfg.span !== null) spanMs = duration(cfg.span, 'span', HOUR);
-  else if (cfg.hours_to_show !== undefined && cfg.hours_to_show !== null) spanMs = duration(cfg.hours_to_show, 'hours_to_show', HOUR);
-  else spanMs = DEFAULTS.spanMs;
-  if (spanMs <= 0) fail(cfg.span !== undefined ? 'span' : 'hours_to_show', 'must be > 0');
-  spanMs = Math.round(spanMs);
+  const { spanMs, spanStart } = normalizeSpan(cfg, ctx);
 
   const ds = optEnum(cfg.data_source, DATA_SOURCES, 'data_source') ?? 'auto';
   const period = optEnum(cfg.statistics_period, STATISTICS_PERIODS, 'statistics_period');
@@ -704,7 +763,7 @@ export function normalizeConfig(raw: CardConfig): NormalizedConfig {
 
   const yAxes = normalizeYAxes(cfg.y_axes, ctx);
   const cardGroupBy = normalizeGroupBy(cfg.group_by, 'group_by', ctx);
-  const series = normalizeSeries(seriesRaw as Array<SeriesConfig | string>, yAxes, cardGroupBy, ctx, seriesKey);
+  const series = normalizeSeries(seriesRaw as Array<SeriesConfig | string>, yAxes, cardGroupBy, dataSource, ctx, seriesKey);
 
   if (ds === 'history' && period !== undefined && !series.some((s) => s.statistic !== 'auto' || isExternalStatistic(s.entity))) {
     ctx.warnings.push('statistics_period is ignored with data_source: history');
@@ -714,6 +773,7 @@ export function normalizeConfig(raw: CardConfig): NormalizedConfig {
     type: typeof cfg.type === 'string' ? cfg.type : 'custom:echart-graph-card',
     title: optText(cfg.title, 'title'),
     spanMs,
+    spanStart,
     height: normalizeHeight(cfg.height),
     dataSource,
     dataSourceAuto: ds === 'auto',

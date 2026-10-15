@@ -1,4 +1,5 @@
 import { seriesValue } from './history';
+import { attributeSeriesPoints } from './list';
 import { BucketAccumulator, bucketRange, bucketTimeZone, clipToWindow, fillBuckets, transformValue } from './transform';
 import { attributeUnit } from './units';
 import type { HassEntityState, HomeAssistant, Point, SeriesData } from '../types';
@@ -9,14 +10,15 @@ import type { HassEntityState, HomeAssistant, Point, SeriesData } from '../types
  * Usage (card): after every (re)fetch call `reset(data, hass)` with the `hass` object that was
  * current when the fetch STARTED (so changes that race the fetch are still appended; duplicates
  * are skipped); on each `hass` set call `append(hass)` and, if it returns true, schedule a
- * throttled redraw; before redrawing call `trim(now - cfg.spanMs)`. After a gap in the live
+ * throttled redraw; before redrawing call `trim(windowStart)`. After a gap in the live
  * feed (detached card, reconnect) `backfill()` merges the recorder's history of the gap.
  *
  * The SeriesData objects passed to reset() are owned by the buffer and mutated in place
  * (`points` array contents, `rawTail`, `latest`, and `error`/`name`/`unit` when a previously
  * missing entity appears); `data` exposes them. Point tuples are never mutated, only replaced,
  * and appends only touch points at or after the previous last point's time (the chart's
- * reduction cache in src/data/reduce.ts relies on that).
+ * reduction cache in src/data/reduce.ts relies on that). List attribute series are the
+ * exception: each change gives them a new `points` array (a fresh cache).
  */
 export class LiveBuffer {
   private _data: SeriesData[] = [];
@@ -60,7 +62,9 @@ export class LiveBuffer {
    *   Grouped series: the open bucket is updated incrementally (O(1), BucketAccumulator; same
    *   bucket -> last point replaced; new bucket -> empty buckets in between filled per groupBy
    *   rules, new point pushed, `rawTail` restarted).
-   * Statistics series only get `latest` updated.
+   * Statistics series only get `latest` updated. List attribute series (`source: 'attribute'`)
+   * are re-read from the new state: `points` is REPLACED by a new array (its whole content may
+   * change), `latest` and `error` follow.
    * Returns true if any series' points or latest changed.
    */
   append(hass: HomeAssistant): boolean {
@@ -142,6 +146,16 @@ export class LiveBuffer {
 
   private _applyState(d: SeriesData, st: HassEntityState, hass: HomeAssistant, getZone: () => string | undefined): boolean {
     const s = d.series;
+    if (d.source === 'attribute') {
+      // The trim on the next redraw drops what lies before the window.
+      const next = attributeSeriesPoints(s, hass, Number.NEGATIVE_INFINITY, Date.now(), getZone());
+      d.points = next.points;
+      d.latest = next.latest;
+      if (s.name === undefined && typeof st.attributes?.friendly_name === 'string') d.name = st.attributes.friendly_name;
+      if (next.error) d.error = next.error;
+      else delete d.error;
+      return true;
+    }
     let changed = false;
     if (d.error !== undefined && d.error === `Entity not found: ${s.entity}`) {
       // The entity appeared after the load: adopt its metadata.

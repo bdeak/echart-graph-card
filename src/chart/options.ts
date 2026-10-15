@@ -1,7 +1,8 @@
 import { DAY, HOUR, MINUTE, SECOND, WEEK } from '../config';
 import { binaryStatePair, domainOf } from '../data/history';
-import { reducePoints, reducePointsDetail } from '../data/reduce';
-import type { ECOption, EChartsCoreOption, LineSeriesOption } from './echarts';
+import { lowerBound, reducePoints, reducePointsDetail } from '../data/reduce';
+import { bucketTimeZone, chartWindow } from '../data/transform';
+import type { BarSeriesOption, ECOption, EChartsCoreOption, LineSeriesOption } from './echarts';
 import { formatAxisValue, formatValue, makeTimeFormatter, timeTicks, zoneMatchesBrowser } from './format';
 import type { TimeFormatter } from './format';
 import { scaleAlpha, withAlpha } from './theme';
@@ -25,7 +26,7 @@ import type {
 /** Extra inputs to buildOptions (kept explicit so buildOptions stays pure). */
 export interface BuildContext {
   hass: HomeAssistant;
-  /** Epoch ms; x-axis spans [now - cfg.spanMs, now]. */
+  /** Epoch ms. The x-axis spans chartWindow(cfg, now): [now - cfg.spanMs, now], or the aligned window. */
   now: number;
   /** Maps user colors (`var(--x)`) to concrete colors; the card passes `c => resolveColor(this, c)`. Default identity. */
   resolveColor?: (c: string) => string;
@@ -97,6 +98,12 @@ const HOLD_MIN_JUMP_RATIO = 0.1;
 const NO_ANIMATION_POINTS = 2000;
 const ANIMATION_MS = 300;
 const FONT_SIZE = 11;
+/** Bars fill this share of their bucket (the rest is the gap between neighbouring bars). */
+const BAR_WIDTH_RATIO = 0.72;
+/** Estimated px taken by one visible y-axis' labels (bar width cap; the real width varies). */
+const AXIS_LABEL_PX = 44;
+/** Corner radius of bars (top corners for positive data, all corners when it goes negative). */
+const BAR_RADIUS = 3;
 
 const PERIOD_MS: Record<StatisticsPeriod, number> = {
   '5minute': 5 * MINUTE,
@@ -326,6 +333,16 @@ interface PlotOpts {
   reduceAbove: number;
   /** Zoomed-in range with its finer block length. */
   detail?: { from: number; to: number; ms: number };
+  /** The x-axis window (list attribute series are cut to it, keeping one point beyond each edge). */
+  start: number;
+  end: number;
+}
+
+/** Points inside [start, end] plus the nearest one beyond each edge (lines still reach the edges). */
+function sliceToWindow(points: Point[], start: number, end: number): Point[] {
+  const i0 = Math.max(0, lowerBound(points, start) - 1);
+  const i1 = Math.min(points.length, lowerBound(points, end + 1) + 1);
+  return i0 === 0 && i1 === points.length ? points : points.slice(i0, i1);
 }
 
 /**
@@ -334,14 +351,19 @@ interface PlotOpts {
  * points (insertHolds) unless the series is stepped anyway, and the last value is extended to
  * `now` (the line reaches the right edge). Stepped statistics rows cover [start, start +
  * bucket): the last row is extended to its end so its step has a width (like every other bucket).
+ * List attribute series are cut to the window (they may reach far into the future).
+ * `shift` > 0 moves every point by that much (bucket centres, see buildOptions); shifted lines
+ * are not extended. Bars are never extended, and zero-height bars are dropped (null).
  */
-function plotPoints(d: SeriesData, now: number, bucketMs: number, opts: PlotOpts): Point[] {
-  let pts = d.points;
+function plotPoints(d: SeriesData, now: number, bucketMs: number, opts: PlotOpts, shift = 0): Point[] {
+  let pts = d.source === 'attribute' ? sliceToWindow(d.points, opts.start, opts.end) : d.points;
   if (opts.reduceMs > 0 && pts.length > opts.reduceAbove) {
     pts = opts.detail
       ? reducePointsDetail(pts, opts.reduceMs, opts.detail.from, opts.detail.to, opts.detail.ms)
       : reducePoints(pts, opts.reduceMs);
   }
+  if (d.series.type === 'bar') return pts.map(([t, v]): Point => [t + shift, v === 0 ? null : v]);
+  if (shift > 0) return pts.map(([t, v]): Point => [t + shift, v]);
   const step = resolveStep(d.series.line.step, d.isBinary);
   if (d.source === 'history') {
     if (!d.series.groupBy && step === false) {
@@ -479,6 +501,7 @@ function tooltipResolution(cfg: NormalizedConfig, data: SeriesData[]): number {
     let r: number;
     if (d.source === 'statistics') r = d.series.groupBy?.durationMs ?? PERIOD_MS[cfg.statisticsPeriod] ?? HOUR;
     else if (d.series.groupBy) r = d.series.groupBy.durationMs;
+    else if (d.source === 'attribute') r = MINUTE;
     else r = cfg.spanMs <= 6 * HOUR ? SECOND : MINUTE;
     res = Math.min(res, r);
   }
@@ -498,8 +521,25 @@ interface SeriesInfo {
   hidden: boolean;
   /** Statistics bucket length (value valid for [start, start + bucketMs)); 0 = sample-and-hold. */
   bucketMs: number;
+  /** Bar series: the bucket each bar covers (tooltip header shows its range); 0 otherwise. */
+  barMs: number;
   /** Texts for 0 / 1 (binary series). */
   onOff: [string, string];
+}
+
+/**
+ * Typical length of the interval one point covers (bars and bucket centres): statistics rows and
+ * group_by buckets have theirs; list attribute items (forecast periods, price slots) cover the
+ * time to the next item. 0 = a sample (raw history).
+ */
+function intervalOf(d: SeriesData, cfg: NormalizedConfig): number {
+  if (d.series.groupBy) return d.series.groupBy.durationMs;
+  if (d.source === 'statistics') return PERIOD_MS[cfg.statisticsPeriod] ?? 0;
+  if (d.source === 'attribute') {
+    const iv = typicalInterval(d.points);
+    return Number.isFinite(iv) && iv > 0 ? iv : 0;
+  }
+  return 0;
 }
 
 /**
@@ -508,6 +548,12 @@ interface SeriesInfo {
  * or after a bucket), `null` = gap (unavailable).
  */
 export function valueAt(points: Point[], t: number, bucketMs = 0): number | null | undefined {
+  const p = pointAt(points, t, bucketMs);
+  return p ? p[1] : undefined;
+}
+
+/** The point valueAt reads (last at or before `t`, within its bucket), undefined if none. */
+function pointAt(points: Point[], t: number, bucketMs = 0): Point | undefined {
   let lo = 0;
   let hi = points.length - 1;
   let idx = -1;
@@ -521,9 +567,9 @@ export function valueAt(points: Point[], t: number, bucketMs = 0): number | null
     }
   }
   if (idx < 0) return undefined;
-  const [time, v] = points[idx];
-  if (bucketMs > 0 && t >= time + bucketMs) return undefined;
-  return v;
+  const p = points[idx];
+  if (bucketMs > 0 && t >= p[0] + bucketMs) return undefined;
+  return p;
 }
 
 function stopColor(stops: ColorThreshold[], v: number | null | undefined, fallback: string): string {
@@ -575,7 +621,16 @@ function tooltipFormatter(
       );
     }
     if (!rows.length) return '';
-    const header = `<div style="font-size:11px;color:${escapeHtml(theme.secondaryText)};margin-bottom:4px;white-space:nowrap">${escapeHtml(tf.tooltip(time, resolution))}</div>`;
+    // Over a bar: its bucket's range ("Wed 15 Oct, 08:00 – 09:00") instead of the bar centre.
+    let when = tf.tooltip(time, resolution);
+    for (const si of info) {
+      if (si.hidden || !(si.barMs > 0) || si.barMs >= DAY) continue;
+      const p = pointAt(si.points, time, si.barMs);
+      if (!p) continue;
+      when = `${tf.tooltip(p[0], resolution)} – ${tf.time(p[0] + si.barMs)}`;
+      break;
+    }
+    const header = `<div style="font-size:11px;color:${escapeHtml(theme.secondaryText)};margin-bottom:4px;white-space:nowrap">${escapeHtml(when)}</div>`;
     return header + rows.join('');
   };
 }
@@ -704,7 +759,8 @@ function thresholdCarriers(
  * config/theme change, `lazyUpdate` for live redraws).
  *
  * Behavior contract:
- * - xAxis `type: 'time'`, min `now - spanMs`, max `now`; labels via makeTimeFormatter(ctx.hass).axis
+ * - xAxis `type: 'time'` over chartWindow (min `now - spanMs`, max `now`; or the aligned window
+ *   for `span.start`, which may end in the future); labels via makeTimeFormatter(ctx.hass).axis
  *   (day ticks emphasised); hidden when !cfg.show.xAxis. No axis lines/ticks; text uses
  *   theme.secondaryText. When the display zone differs from the browser's, ticks are computed
  *   in that zone (axisLabel.customValues) so they land on wall-clock hours / local midnight.
@@ -724,6 +780,15 @@ function thresholdCarriers(
  *   line.step, `'auto'` -> `'end'` when isBinary else false; `smooth` = line.smooth (0 -> false;
  *   forced off when stepped; smoothMonotone 'x'); lineStyle width/type; series `color` via
  *   ctx.resolveColor (series-level so a visualMap can recolor the line).
+ * - `type: bar` series -> ECharts bars centred on their bucket (statistics period, group_by, or
+ *   the typical gap between list items), 72 % of it wide (capped from ctx.width), fill = series
+ *   color at fillOpacity (gradient: fading towards the baseline; none: outline only), border
+ *   line.width in the series color, rounded top corners; zero values draw no bar; an axis with
+ *   bars and no configured min (max) starts (ends) at zero for non-negative (non-positive) data. With bars in
+ *   the card, bucketed non-stepped lines are drawn at bucket centres as well. The tooltip header
+ *   then shows the hovered bar's bucket range.
+ * - List attribute series (`source: 'attribute'`) are cut to the window (one point beyond each
+ *   edge) and looked up by item interval in the tooltip.
  * - fill: gradient -> vertical LinearGradient from fillOpacity at the line to 0 at the baseline
  *   (direction aware for negative/mixed data); solid -> areaStyle opacity fillOpacity; none -> no
  *   areaStyle.
@@ -753,24 +818,43 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
   const resolve = ctx.resolveColor ?? ((c: string): string => c);
   const hidden = ctx.hiddenKeys ?? new Set(cfg.series.filter((s) => s.hidden).map((s) => s.key));
   const now = ctx.now;
-  const start = now - cfg.spanMs;
+  const { start, end } = chartWindow(cfg.spanMs, cfg.spanStart, now, bucketTimeZone(hass));
+  /** Window length (an aligned day window is 23 h / 25 h on DST days). */
+  const windowMs = end - start;
   const spanMs = cfg.spanMs;
   const tf = makeTimeFormatter(hass);
   const { axes, seriesAxis } = assignAxes(cfg, data);
   const names = legendNames(data);
-  // Statistics rows (and group_by buckets of them) are valid for one bucket each.
-  const bucketList = data.map((d) =>
-    d.source === 'statistics' ? (d.series.groupBy?.durationMs ?? PERIOD_MS[cfg.statisticsPeriod] ?? 0) : 0,
-  );
+  // The interval each point covers. Statistics rows (and group_by buckets of them) and list
+  // items are only valid for theirs (tooltip lookup); grouped history holds until the next bucket.
+  const intervals = data.map((d) => intervalOf(d, cfg));
+  const bucketList = data.map((d, i) => (d.source === 'history' ? 0 : intervals[i]));
+  // Bars stand on the centre of their bucket. In a card with bars, bucketed lines (not stepped)
+  // are drawn at bucket centres too, so a forecast line peaks over the bar of the same hour.
+  const barCount = data.filter((d) => d.series.type === 'bar').length;
+  const shifts = data.map((d, i) => {
+    if (!(intervals[i] > 0)) return 0;
+    if (d.series.type === 'bar') return intervals[i] / 2;
+    return barCount > 0 && resolveStep(d.series.line.step, d.isBinary) === false ? intervals[i] / 2 : 0;
+  });
   const width = ctx.width && ctx.width > 0 ? ctx.width : undefined;
   const zoom = cfg.show.zoom && ctx.zoom && (ctx.zoom.start > 0 || ctx.zoom.end < 100) ? ctx.zoom : undefined;
-  const plotOpts: PlotOpts = { reduceMs: width ? Math.max(1, Math.ceil(spanMs / width)) : 0, reduceAbove: (width ?? 0) * REDUCE_POINTS_PER_PX };
-  if (width && zoom) {
-    const from = start + (spanMs * zoom.start) / 100;
-    const to = start + (spanMs * zoom.end) / 100;
-    if (to > from) plotOpts.detail = { from, to, ms: Math.max(1, Math.ceil((to - from) / width)) };
+  const plotOpts: PlotOpts = {
+    reduceMs: width ? Math.max(1, Math.ceil(windowMs / width)) : 0,
+    reduceAbove: (width ?? 0) * REDUCE_POINTS_PER_PX,
+    start,
+    end,
+  };
+  let visibleMs = windowMs;
+  if (zoom) {
+    const from = start + (windowMs * zoom.start) / 100;
+    const to = start + (windowMs * zoom.end) / 100;
+    if (to > from) {
+      visibleMs = to - from;
+      if (width) plotOpts.detail = { from, to, ms: Math.max(1, Math.ceil((to - from) / width)) };
+    }
   }
-  const pointsList = data.map((d, i) => plotPoints(d, now, bucketList[i], plotOpts));
+  const pointsList = data.map((d, i) => plotPoints(d, now, bucketList[i], plotOpts, shifts[i]));
   const totalPoints = pointsList.reduce((n, p) => n + p.length, 0);
   const animate = ctx.animate !== false && totalPoints <= NO_ANIMATION_POINTS;
   // Chart min/max markers only when the header does not already show min / max / avg.
@@ -820,12 +904,14 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
     });
     dataMin = Math.min(dataMin, thresholdExtents[i].min);
     dataMax = Math.max(dataMax, thresholdExtents[i].max);
-    return {
-      min: resolveBound(conf?.min, conf?.softMin, dataMin, 'min'),
-      max: resolveBound(conf?.max, conf?.softMax, dataMax, 'max'),
-      dataMin,
-      dataMax,
-    };
+    let min = resolveBound(conf?.min, conf?.softMin, dataMin, 'min');
+    let max = resolveBound(conf?.max, conf?.softMax, dataMax, 'max');
+    // Bars grow from zero: an auto end of an axis carrying (visible) bars includes it.
+    if (data.some((d, j) => seriesAxis[j] === i && d.series.type === 'bar' && !hidden.has(d.series.key))) {
+      if (min === undefined && conf?.softMin === undefined && dataMin >= 0) min = 0;
+      if (max === undefined && conf?.softMax === undefined && dataMax <= 0) max = 0;
+    }
+    return { min, max, dataMin, dataMax };
   });
   // Fully fixed visible axes: even intervals, sharing one split count when a common one is close to
   // the target so labels of every axis sit on the same grid lines (0..5000 W with 0..100 %).
@@ -918,10 +1004,40 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
 
   // ---- series -------------------------------------------------------------
   const info: SeriesInfo[] = [];
+  /** show.extrema without header: min / max markers (small ringed dot + value label). */
+  const extremaMarks = (d: SeriesData, color: string, precision: number | undefined): NonNullable<LineSeriesOption['markPoint']> => {
+    const label = (position: 'top' | 'bottom') => ({
+      show: true,
+      position,
+      distance: 5,
+      color: theme.text,
+      fontSize: 10,
+      fontWeight: 500 as const,
+      formatter: (p: { value?: unknown }): string =>
+        formatValue(typeof p.value === 'number' ? p.value : Number(p.value), d.unit, precision, locale),
+    });
+    return {
+      silent: true,
+      animation: false,
+      symbol: 'circle',
+      symbolSize: 6,
+      itemStyle: { color, borderColor: theme.background, borderWidth: 1.5 },
+      emphasis: { disabled: true },
+      data: [
+        { type: 'max', name: 'max', label: label('top') },
+        { type: 'min', name: 'min', label: label('bottom') },
+      ],
+    };
+  };
   const visualMap: VisualMapOption[] = [];
   const legendSelected: Record<string, boolean> = {};
 
-  const series: LineSeriesOption[] = data.map((d, i) => {
+  // Bar width cap from the estimated plot width (ECharts sizes bars by the smallest gap between
+  // them, which is the whole axis while a series has a single bar).
+  const visibleAxes = Math.max(1, visible.filter(Boolean).length);
+  const plotPx = width ? Math.max(40, width - 24 - AXIS_LABEL_PX * visibleAxes) : undefined;
+
+  const series: Array<LineSeriesOption | BarSeriesOption> = data.map((d, i) => {
     const s = d.series;
     const name = names[i];
     const stops = s.colorThresholds.map((t) => ({ value: t.value, color: resolve(t.color) }));
@@ -945,9 +1061,52 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
       precision,
       hidden: hidden.has(s.key),
       bucketMs: bucketList[i],
+      barMs: s.type === 'bar' ? intervals[i] : 0,
       onOff: d.isBinary ? binaryLabels(hass, s) : ['0', '1'],
     });
     legendSelected[name] = !hidden.has(s.key);
+
+    if (s.type === 'bar') {
+      const maxBar =
+        plotPx && intervals[i] > 0 ? Math.max(2, (plotPx * intervals[i] * BAR_WIDTH_RATIO) / visibleMs / barCount) : undefined;
+      const fillColor =
+        s.fill === 'none' || s.fillOpacity <= 0
+          ? 'rgba(0, 0, 0, 0)'
+          : s.fill === 'gradient'
+            ? (fillGradient(withAlpha(color, s.fillOpacity) ?? color, extents[i]) as never)
+            : (withAlpha(color, s.fillOpacity) ?? color);
+      const negative = extents[i].min < 0;
+      const borderRadius = negative ? BAR_RADIUS - 1 : [BAR_RADIUS, BAR_RADIUS, 0, 0];
+      const bar: BarSeriesOption = {
+        type: 'bar',
+        id: s.key,
+        name,
+        color,
+        data: points,
+        xAxisIndex: 0,
+        yAxisIndex: seriesAxis[i],
+        barWidth: `${Math.round(BAR_WIDTH_RATIO * 100)}%`,
+        barGap: '12%',
+        barMinWidth: 1,
+        ...(maxBar !== undefined ? { barMaxWidth: maxBar } : {}),
+        // Value-coloured bars take the visualMap colours (fill and border alike).
+        itemStyle: useVisualMap
+          ? { borderWidth: 0, borderRadius, opacity: Math.max(0.6, s.fillOpacity) }
+          : { color: fillColor, borderColor: color, borderWidth: width, borderRadius },
+        emphasis: {
+          focus: 'none',
+          itemStyle: useVisualMap ? {} : { color: withAlpha(color, Math.min(1, s.fillOpacity + 0.2)) ?? color },
+        },
+        clip: true,
+        legendHoverLink: false,
+        z: 2,
+      };
+      if (useVisualMap) {
+        visualMap.push({ type: 'piecewise', show: false, seriesIndex: i, dimension: 1, pieces: visualPieces(stops), outOfRange: { color: baseColor } });
+      }
+      if (markExtrema && points.length > 1) bar.markPoint = extremaMarks(d, color, precision);
+      return bar;
+    }
 
     const opt: LineSeriesOption = {
       type: 'line',
@@ -1001,30 +1160,7 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
       });
     }
 
-    if (markExtrema && !d.isBinary && points.length > 1) {
-      const label = (position: 'top' | 'bottom') => ({
-        show: true,
-        position,
-        distance: 5,
-        color: theme.text,
-        fontSize: 10,
-        fontWeight: 500 as const,
-        formatter: (p: { value?: unknown }): string =>
-          formatValue(typeof p.value === 'number' ? p.value : Number(p.value), d.unit, precision, locale),
-      });
-      opt.markPoint = {
-        silent: true,
-        animation: false,
-        symbol: 'circle',
-        symbolSize: 6,
-        itemStyle: { color, borderColor: theme.background, borderWidth: 1.5 },
-        emphasis: { disabled: true },
-        data: [
-          { type: 'max', name: 'max', label: label('top') },
-          { type: 'min', name: 'min', label: label('bottom') },
-        ],
-      };
-    }
+    if (markExtrema && !d.isBinary && points.length > 1) opt.markPoint = extremaMarks(d, color, precision);
     return opt;
   });
 
@@ -1040,12 +1176,12 @@ export function buildOptions(cfg: NormalizedConfig, data: SeriesData[], theme: T
 
   // ---- x axis -------------------------------------------------------------
   const maxTicks = ctx.width && ctx.width > 0 ? Math.max(2, Math.min(12, Math.round(ctx.width / 90))) : 6;
-  const customTicks = cfg.show.xAxis && !zoneMatchesBrowser(tf, start, now) ? timeTicks(tf, start, now, maxTicks) : undefined;
+  const customTicks = cfg.show.xAxis && !zoneMatchesBrowser(tf, start, end) ? timeTicks(tf, start, end, maxTicks) : undefined;
   const emphasiseDays = spanMs <= WEEK;
   const xAxis: NonNullable<ECOption['xAxis']> = {
     type: 'time',
     min: start,
-    max: now,
+    max: end,
     show: cfg.show.xAxis,
     axisLine: { show: false },
     axisTick: { show: false, ...(customTicks ? { customValues: customTicks } : {}) },

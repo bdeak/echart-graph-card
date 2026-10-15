@@ -13,6 +13,8 @@ import { buildOptions, legendNames } from './chart/options';
 import { readTheme, resolveColor } from './chart/theme';
 import { LiveBuffer } from './data/live';
 import { loadHistoryRange, loadSeriesData } from './data/loader';
+import { bucketTimeZone, chartWindow } from './data/transform';
+import type { ChartWindow } from './data/transform';
 import type { CardConfig, HomeAssistant, NormalizedConfig, SeriesData, ThemeColors } from './types';
 
 /** Minimum time between two live (hass-driven) redraws. */
@@ -89,10 +91,11 @@ function errorMessage(e: unknown): string {
 function dataSignature(cfg: NormalizedConfig): string {
   return JSON.stringify([
     cfg.spanMs,
+    cfg.spanStart,
     cfg.dataSource,
     cfg.dataSourceAuto,
     cfg.statisticsPeriod,
-    cfg.series.map((s) => [s.key, s.name, s.unit, s.transform, s.groupBy, s.statistic]),
+    cfg.series.map((s) => [s.key, s.name, s.unit, s.transform, s.groupBy, s.statistic, s.timeKey]),
   ]);
 }
 
@@ -164,6 +167,8 @@ export class EchartGraphCard extends LitElement {
   private _loadSeq = 0;
   /** Start time (epoch ms) of the last successful load; also the window end for `update: none`. */
   private _loadedAt = 0;
+  /** Window start of the last successful full load (span.start: a new day reloads). */
+  private _loadedStart = 0;
   private _retryAt = 0;
   /** The last load / refresh failed: retried (full reload) from `_retryAt` on. */
   private _reloadFailed = false;
@@ -350,6 +355,7 @@ export class EchartGraphCard extends LitElement {
               hiddenKeys: this._hiddenKeys,
               onToggle: this._toggleSeries,
               now: this._windowEnd(),
+              start: this._window().start,
             })
           : cfg.title
             ? html`<div class="header"><div class="title">${cfg.title}</div></div>`
@@ -494,6 +500,7 @@ export class EchartGraphCard extends LitElement {
       this._data = data;
       this._haveSig = sig;
       this._loadedAt = startedAt;
+      this._loadedStart = chartWindow(cfg.spanMs, cfg.spanStart, startedAt, bucketTimeZone(hass)).start;
       this._loaded = true;
       this._error = undefined;
       this._retryAt = 0;
@@ -643,8 +650,14 @@ export class EchartGraphCard extends LitElement {
       if (now >= this._retryAt) void this._load();
       return;
     }
-    if (this._reloadDue(now)) void this._load();
+    if (this._reloadDue(now) || this._newAlignedWindow()) void this._load();
     else if (cfg.update.mode === 'live' && now >= this._statsDueAt) void this._refreshStatistics();
+  }
+
+  /** `span.start`: the aligned window moved on (a new day began) since the last load. */
+  private _newAlignedWindow(): boolean {
+    const cfg = this._config;
+    return !!cfg && cfg.spanStart !== null && cfg.update.mode !== 'none' && this._loaded && this._window().start !== this._loadedStart;
   }
 
   private readonly _onVisibilityChange = (): void => {
@@ -731,9 +744,17 @@ export class EchartGraphCard extends LitElement {
     return this._theme;
   }
 
-  /** Right edge of the time window: now, or the load time for `update: none`. */
+  /** "Now" of the chart: the current time, or the load time for `update: none`. */
   private _windowEnd(): number {
     return this._config?.update.mode === 'none' && this._loadedAt ? this._loadedAt : Date.now();
+  }
+
+  /** The visible window at `_windowEnd()` (see chartWindow). */
+  private _window(): ChartWindow {
+    const cfg = this._config;
+    const now = this._windowEnd();
+    if (!cfg) return { start: now, end: now };
+    return chartWindow(cfg.spanMs, cfg.spanStart, now, bucketTimeZone(this._hass));
   }
 
   /**
@@ -801,7 +822,7 @@ export class EchartGraphCard extends LitElement {
     if (kind === 0) return;
     this._lastRedrawAt = Date.now();
     if (kind === 2 && this._loaded) {
-      if (cfg.update.mode !== 'none') this._live.trim(this._windowEnd() - cfg.spanMs);
+      if (cfg.update.mode !== 'none') this._live.trim(this._window().start);
       this._applyChart(false);
     }
     this._rev++;

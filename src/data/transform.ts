@@ -1,5 +1,5 @@
 import { browserTimeZone, resolveTimeZone } from '../chart/format';
-import type { GroupByFunc, HomeAssistant, NormalizedTransform, Point } from '../types';
+import type { GroupByFunc, HomeAssistant, NormalizedTransform, Point, SpanStart } from '../types';
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
@@ -141,6 +141,30 @@ export function bucketRange(t: number, durationMs: number, zone?: string): [numb
   }
   const start = Math.floor(t / durationMs) * durationMs;
   return [start, start + durationMs];
+}
+
+/** The visible time window `[start, end]` (epoch ms). */
+export interface ChartWindow {
+  start: number;
+  end: number;
+}
+
+/**
+ * The card's time window. Without `spanStart`: `[now - spanMs, now]`. With `spanStart: 'day'`:
+ * from local midnight (in `zone`, see bucketTimeZone; UTC without one) of the day containing
+ * `now`, `spanMs` of wall-clock time long, so a 24h window ends at the next midnight on 23 h /
+ * 25 h DST days too. The aligned window can end in the future (forecasts, the rest of today).
+ */
+export function chartWindow(spanMs: number, spanStart: SpanStart | null, now: number, zone?: string): ChartWindow {
+  if (spanStart !== 'day') return { start: now - spanMs, end: now };
+  if (zone !== undefined && isValidTimeZone(zone)) {
+    const startWall = Math.floor((now + zoneOffset(zone, now)) / DAY_MS) * DAY_MS;
+    const start = wallToUtc(zone, startWall);
+    const end = wallToUtc(zone, startWall + spanMs);
+    if (start <= now && end > start) return { start, end };
+  }
+  const start = Math.floor(now / DAY_MS) * DAY_MS;
+  return { start, end: start + spanMs };
 }
 
 // ---------------------------------------------------------------------------

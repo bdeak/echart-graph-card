@@ -55,6 +55,12 @@ export type AxisPosition = 'left' | 'right';
 
 export type UpdateMode = 'live' | 'interval' | 'none';
 
+/** How a series is drawn. `bar`: one bar per bucket (statistics row, group_by bucket or list item). */
+export type SeriesType = 'line' | 'bar';
+
+/** `span.start`: align the window start to this calendar boundary (HA display time zone). */
+export type SpanStart = 'day';
+
 // ---------------------------------------------------------------------------
 // 1. Raw YAML config
 // ---------------------------------------------------------------------------
@@ -170,6 +176,17 @@ export interface ThresholdConfig {
   y_axis?: string;
 }
 
+/**
+ * `span` as an object: a window aligned to a calendar boundary instead of ending now, e.g.
+ * `{ start: day }` = today 00:00 to 24:00 (the right part lies in the future until the day ends).
+ */
+export interface SpanConfig {
+  /** Required. */
+  start: SpanStart;
+  /** Window length from the aligned start. Bare numbers are hours. Default: `hours_to_show`, else 24h. */
+  duration?: DurationInput;
+}
+
 /** One entry of `series:` (a bare string is shorthand for `{ entity: <string> }`). */
 export interface SeriesConfig {
   /** Entity id (`sensor.x`) or external statistic id (`source:stat_id`). Required. */
@@ -188,6 +205,19 @@ export interface SeriesConfig {
   y_axis?: string;
   /** Plot this attribute instead of the state. */
   attribute?: string;
+  /**
+   * Read the series from the CURRENT value of `attribute`, a list of objects (e.g. Solcast's
+   * `detailedForecast`, energy price lists): this key of each item is the value. Requires
+   * `attribute`; no history or statistics are fetched, and the series follows the entity live.
+   */
+  value_key?: string;
+  /**
+   * With `value_key`: the key holding each item's timestamp (ISO string, or epoch s / ms).
+   * Default: the first of `period_start`, `start`, `start_time`, `startsAt`, `datetime`, `time`, `from`.
+   */
+  time_key?: string;
+  /** `line` (default) or `bar` (`column` is accepted as an alias). */
+  type?: SeriesType | 'column';
   line?: LineConfig;
   /** Default: `gradient` when the card has <= 2 series, else `none` (also `none` with >= 2 `color_thresholds`). */
   fill?: FillMode;
@@ -220,8 +250,11 @@ export interface CardConfig {
   title?: string;
   /** Window length: a number of hours, or a duration string (`"36h"`). Default 24. Ignored when `span` is given. */
   hours_to_show?: number | string;
-  /** Window length as a duration (`"7d"`); bare numbers are hours. Takes precedence over `hours_to_show`. */
-  span?: DurationInput;
+  /**
+   * Window length as a duration (`"7d"`); bare numbers are hours. Takes precedence over
+   * `hours_to_show`. An object (`{ start: day }`) aligns the window to the start of the day.
+   */
+  span?: DurationInput | SpanConfig;
   /**
    * Chart height. Number = px, string = an absolute or viewport CSS length (`250px`, `15rem`,
    * `30vh`). Default `220px`. In the sections layout the card fills its grid cell only when
@@ -282,6 +315,11 @@ export interface NormalizedSeries {
   key: string;
   entity: string;
   attribute?: string;
+  /** List attribute series (see SeriesConfig.value_key): key of each item's value. */
+  valueKey?: string;
+  /** List attribute series: explicit time key, undefined = auto-detect (LIST_TIME_KEYS). */
+  timeKey?: string;
+  type: SeriesType;
   /** Explicit name only. The display name is resolved at load time into SeriesData.name. */
   name?: string;
   /** Explicit color or palette color by index. May be `var(--x)`; resolve with resolveColor() before handing to ECharts. */
@@ -379,8 +417,13 @@ export interface NormalizedShow {
 export interface NormalizedConfig {
   type: string;
   title?: string;
-  /** Visible window length in ms: [now - spanMs, now]. */
+  /**
+   * Window length in ms. Without `spanStart` the window is [now - spanMs, now]; with it, it starts
+   * at the aligned boundary (see chartWindow in src/data/transform.ts).
+   */
   spanMs: number;
+  /** `span.start`: calendar-aligned window start, null = the window ends now. */
+  spanStart: SpanStart | null;
   /** CSS length, e.g. `'220px'`. */
   height: string;
   /**
@@ -430,8 +473,11 @@ export interface SeriesData {
    * unavailable/unknown/non-numeric, `undefined` when the entity is not in hass.states.
    */
   latest?: number | null;
-  /** Which backend produced `points`. Live append only applies to `history`. */
-  source: 'history' | 'statistics';
+  /**
+   * Which backend produced `points`. Live append only applies to `history`; `attribute` series
+   * (list attributes, `value_key`) are re-read from hass.states whenever the entity changes.
+   */
+  source: 'history' | 'statistics' | 'attribute';
   /**
    * Grouped history series only: the transformed, ungrouped points of the last (open) bucket,
    * preceded by the last point before it (the value carried into the bucket), so LiveBuffer can

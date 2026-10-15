@@ -850,3 +850,87 @@ describe('buildOptions: legend and height', () => {
     expect(build(cfg, data, { height: 440 }).yAxis[0].splitNumber).toBe(8);
   });
 });
+
+describe('buildOptions: bars and list attribute series', () => {
+  // NOW = 2026-09-26 12:00Z = 14:00 Berlin; Berlin midnight = 2026-09-25 22:00Z.
+  const MIDNIGHT = Date.UTC(2026, 8, 25, 22, 0, 0);
+  const cfg = cfgOf({
+    span: { start: 'day' },
+    statistics_period: 'hour',
+    series: [
+      { entity: 'sensor.solar_today', type: 'bar', statistic: 'change', color: '#FF9800' },
+      { entity: 'sensor.forecast', attribute: 'detailedForecast', value_key: 'pv_estimate', group_by: { func: 'avg', duration: '1h' }, unit: 'kWh' },
+      'sensor.power',
+    ],
+  });
+  const hours = (n: number, f: (i: number) => number): Point[] => Array.from({ length: n }, (_, i) => [MIDNIGHT + i * HOUR, f(i)] as Point);
+  const bars = hours(14, (i) => (i < 7 ? 0 : (i - 6) / 10));
+  const forecast = hours(24, (i) => i / 20);
+  const raw: Point[] = [
+    [MIDNIGHT, 100],
+    [NOW - 10 * MINUTE, 300],
+  ];
+  const data = dataFor(cfg, [
+    { points: bars, unit: 'kWh', source: 'statistics' },
+    { points: forecast, unit: 'kWh', source: 'attribute' },
+    { points: raw, unit: 'W' },
+  ]);
+  const hass = mockHass({ time_zone: 'server' });
+  const opt = build(cfg, data, { hass, width: 600 });
+
+  it('spans the whole local day (aligned window ends in the future)', () => {
+    expect(opt.xAxis).toMatchObject({ min: MIDNIGHT, max: MIDNIGHT + DAY });
+  });
+
+  it('draws bars centred on their bucket, without zero bars', () => {
+    const s = opt.series[0];
+    expect(s).toMatchObject({ type: 'bar', id: '0:sensor.solar_today', barWidth: '72%', barMinWidth: 1 });
+    expect(s.data[0]).toEqual([MIDNIGHT + 30 * MINUTE, null]);
+    expect(s.data[8]).toEqual([MIDNIGHT + 8 * HOUR + 30 * MINUTE, 0.2]);
+    expect(s.itemStyle).toMatchObject({ borderColor: '#FF9800', borderWidth: 1, borderRadius: [3, 3, 0, 0] });
+    expect(s.itemStyle.color).not.toBe('#FF9800'); // translucent fill
+    expect(s.barMaxWidth).toBeGreaterThan(5);
+    expect(s.barMaxWidth).toBeLessThan(20);
+  });
+
+  it('moves bucketed lines to bucket centres in a card with bars, raw history stays', () => {
+    const f = opt.series[1];
+    expect(f.type).toBe('line');
+    expect(f.data[0]).toEqual([MIDNIGHT + 30 * MINUTE, 0]);
+    expect(f.data).toHaveLength(24);
+    const p = opt.series[2];
+    expect(p.data[0]).toEqual([MIDNIGHT, 100]);
+    expect(p.data[p.data.length - 1]).toEqual([NOW, 300]); // extended to now, not to the window end
+  });
+
+  it('keeps bucketed lines at the bucket start without bars', () => {
+    const noBars = cfgOf({ span: { start: 'day' }, series: [cfg.raw.series?.[1] as SeriesConfig] });
+    const o = build(noBars, dataFor(noBars, [{ points: forecast, unit: 'kWh', source: 'attribute' }]), { hass });
+    expect(o.series[0].data[0]).toEqual([MIDNIGHT, 0]);
+  });
+
+  it('cuts list series to the window, keeping one point beyond each edge', () => {
+    const long = hours(72, () => 1).map(([t, v]) => [t - DAY, v] as Point);
+    const c = cfgOf({ span: { start: 'day' }, series: [{ entity: 'sensor.f', attribute: 'l', value_key: 'v' }] });
+    const o = build(c, dataFor(c, [{ points: long, source: 'attribute' }]), { hass });
+    const d = o.series[0].data as Point[];
+    expect(d[0][0]).toBe(MIDNIGHT - HOUR);
+    expect(d[d.length - 1][0]).toBe(MIDNIGHT + DAY + HOUR);
+  });
+
+  it('shows the hovered bar bucket range in the tooltip header', () => {
+    const t = MIDNIGHT + 8 * HOUR + 30 * MINUTE;
+    const html: string = opt.tooltip.formatter([{ seriesId: '0:sensor.solar_today', value: [t, 0.2], axisValue: t }]);
+    expect(html).toContain('08:00 – 09:00');
+    expect(html).toContain('0.2 kWh');
+    expect(html).toContain('0.4 kWh'); // forecast of the same hour
+  });
+
+  it('starts an auto axis with bars at zero', () => {
+    const c = cfgOf({ series: [{ entity: 'sensor.e', type: 'bar', group_by: '1h' }] });
+    const o = build(c, dataFor(c, [{ points: hours(10, (i) => 2 + i), unit: 'kWh' }]), { hass });
+    expect(o.yAxis[0].min).toBe(0);
+    const neg = build(c, dataFor(c, [{ points: hours(10, (i) => -2 - i), unit: 'kWh' }]), { hass });
+    expect(neg.yAxis[0]).toMatchObject({ min: undefined, max: 0 });
+  });
+});

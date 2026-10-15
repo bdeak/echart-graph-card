@@ -26,6 +26,10 @@ const BATTERY_CAPACITY_WH = 10_240;
 const BATTERY_MAX_W = 2_500;
 const BATTERY_FLOOR_PCT = 11;
 const WATER_METER_BASE_L = 482_310;
+/** Lifetime PV energy at the model origin (kWh). */
+const SOLAR_BASE_KWH = 9_412;
+/** PV energy integration step. */
+const SOLAR_STEP_MS = 5 * 60_000;
 /** How far back the battery simulation / water meter integration starts. */
 const MODEL_DAYS = 400;
 const SOC_STEP_MS = 2 * MINUTE;
@@ -148,6 +152,21 @@ interface DayPlan {
   waterTotal: number;
 }
 
+export interface SolarForecastItem {
+  period_start: string;
+  pv_estimate: number;
+  pv_estimate10: number;
+  pv_estimate90: number;
+}
+
+/** Attributes of a Solcast "forecast today" sensor (kWh totals, kW per half hour). */
+export interface SolarForecast {
+  estimate: number;
+  estimate10: number;
+  estimate90: number;
+  detailedForecast: SolarForecastItem[];
+}
+
 export interface HomeModelOptions {
   seed?: number;
   /** Model "now"; anchors the simulation start and the guaranteed demo gaps. */
@@ -169,6 +188,11 @@ export class HomeModel {
   private waterCumLen = 1;
   private soc = new Float32Array(0);
   private socLen = 0;
+  /** Per local day: PV energy (kWh) from midnight to each SOLAR_STEP_MS step. */
+  private readonly solarSteps = new Map<number, Float64Array>();
+  /** solarDayStart[k] = lifetime PV energy at the start of day originDay + k. */
+  private solarDayStart = new Float64Array([SOLAR_BASE_KWH]);
+  private readonly forecasts = new Map<number, SolarForecast>();
   private readonly fridgePhase: number;
 
   constructor(opts: HomeModelOptions = {}) {
@@ -340,15 +364,22 @@ export class HomeModel {
     return Math.max(40, w);
   }
 
-  /** PV output in W (Growatt MIC 3000 TL-X, clipped at 3000 W). */
-  solarW(t: number): number {
+  /** Clear-sky PV output in W (before clouds), 0 at night. */
+  private solarClearW(t: number): number {
     const p = this.plan(localDay(t));
     const h = localHour(t);
     const daylight = 8.2 + 8.3 * p.season;
     const noon = 12.2 + tzOffsetMs(t) / HOUR - 1;
     const x = (h - (noon - daylight / 2)) / daylight;
     if (x <= 0 || x >= 1) return 0;
-    const clear = Math.pow(Math.sin(Math.PI * x), 1.35) * (1250 + 1650 * p.season);
+    return Math.pow(Math.sin(Math.PI * x), 1.35) * (1250 + 1650 * p.season);
+  }
+
+  /** PV output in W (Growatt MIC 3000 TL-X, clipped at 3000 W). */
+  solarW(t: number): number {
+    const clear = this.solarClearW(t);
+    if (clear === 0) return 0;
+    const p = this.plan(localDay(t));
     const passing = 0.5 + 0.5 * noise(t, 11 * MINUTE, this.seed + 21);
     const factor = 1 - p.cloud * (0.35 + 0.6 * passing) + 0.04 * noise(t, 70 * SECOND, this.seed + 22);
     const w = Math.round(clear * clamp(factor, 0.06, 1.05));
@@ -468,6 +499,89 @@ export class HomeModel {
       }
     }
     return clamp(v, 25, 90);
+  }
+
+  // ---- solar energy / forecast ------------------------------------------
+
+  private solarStepsOf(day: number): Float64Array {
+    let a = this.solarSteps.get(day);
+    if (!a) {
+      const m = localMidnight(day);
+      const n = Math.round((localMidnight(day + 1) - m) / SOLAR_STEP_MS);
+      a = new Float64Array(n + 1);
+      let prev = this.solarW(m);
+      for (let k = 0; k < n; k++) {
+        const next = this.solarW(m + (k + 1) * SOLAR_STEP_MS);
+        a[k + 1] = a[k] + ((prev + next) / 2) * (SOLAR_STEP_MS / HOUR) / 1000;
+        prev = next;
+      }
+      this.solarSteps.set(day, a);
+    }
+    return a;
+  }
+
+  /** PV energy since local midnight (kWh), exact to the integration step. */
+  solarTodayKWh(t: number): number {
+    const day = localDay(t);
+    const a = this.solarStepsOf(day);
+    const x = (t - localMidnight(day)) / SOLAR_STEP_MS;
+    const k = Math.max(0, Math.min(a.length - 2, Math.floor(x)));
+    return a[k] + (a[k + 1] - a[k]) * Math.min(1, Math.max(0, x - k));
+  }
+
+  /**
+   * Lifetime PV energy (kWh) as the long-term statistics of a daily counter would sum it up:
+   * completed days plus today in 0.1 kWh steps (the inverter's resolution).
+   */
+  solarTotalKWh(t: number): number {
+    if (t <= this.origin) return SOLAR_BASE_KWH;
+    const k = localDay(t) - this.originDay;
+    if (this.solarDayStart.length <= k) {
+      const next = new Float64Array(k + 1);
+      next.set(this.solarDayStart);
+      for (let i = this.solarDayStart.length; i <= k; i++) {
+        const prev = this.solarStepsOf(this.originDay + i - 1);
+        next[i] = next[i - 1] + Math.floor(prev[prev.length - 1] * 10) / 10;
+      }
+      this.solarDayStart = next;
+    }
+    return this.solarDayStart[k] + Math.floor(this.solarTodayKWh(t) * 10) / 10;
+  }
+
+  /**
+   * Solcast-like forecast of local day `day`: 48 half hours of average kW (P10 / P50 / P90).
+   * The P50 misses the actual production by a per-day error of -10..+15 %. `shiftMs` is
+   * subtracted from the period starts (model -> real time). Cached: the same object per day.
+   */
+  solarForecast(day: number, shiftMs = 0): SolarForecast {
+    const key = day * 1e9 + shiftMs;
+    let f = this.forecasts.get(key);
+    if (!f) {
+      const p = this.plan(day);
+      const bias = 0.9 + 0.25 * hash01(this.seed * 7 + day, 99);
+      const m = localMidnight(day);
+      const n = Math.round((localMidnight(day + 1) - m) / (30 * MINUTE));
+      const items: SolarForecastItem[] = [];
+      let e = 0;
+      let e10 = 0;
+      let e90 = 0;
+      const r4 = (v: number): number => Math.round(v * 10_000) / 10_000;
+      for (let i = 0; i < n; i++) {
+        const t0 = m + i * 30 * MINUTE;
+        let clear = 0;
+        for (let k = 0; k < 6; k++) clear += this.solarClearW(t0 + (k + 0.5) * 5 * MINUTE) / 6;
+        const p50 = Math.min(3000, clear * (1 - 0.65 * p.cloud) * bias) / 1000;
+        const p10 = p50 * (0.55 + 0.25 * (1 - p.cloud));
+        const p90 = Math.min(3, Math.max(p50, Math.min((clear * 1.05) / 1000, p50 * (1.25 + 0.35 * p.cloud))));
+        items.push({ period_start: new Date(t0 - shiftMs).toISOString(), pv_estimate: r4(p50), pv_estimate10: r4(p10), pv_estimate90: r4(p90) });
+        e += p50 / 2;
+        e10 += p10 / 2;
+        e90 += p90 / 2;
+      }
+      f = { estimate: r4(e), estimate10: r4(e10), estimate90: r4(e90), detailedForecast: items };
+      this.forecasts.set(key, f);
+    }
+    return f;
   }
 
   // ---- water / door ------------------------------------------------------
@@ -670,6 +784,27 @@ export function buildEntities(model: HomeModel, shiftMs = 0): EntityDef[] {
       sampleMs: 10 * SECOND,
       statistics: 'total_increasing',
       displayPrecision: 0,
+    },
+    {
+      entity_id: 'sensor.growatt_min_3000_tl_x_growatt_today_s_power_generation',
+      attributes: {
+        friendly_name: "Growatt today's power generation",
+        unit_of_measurement: 'kWh',
+        device_class: 'energy',
+        state_class: 'total_increasing',
+      },
+      state: (t) => num(Math.floor(model.solarTodayKWh(m(t)) * 10) / 10, 1),
+      value: (t) => model.solarTotalKWh(m(t)),
+      sampleMs: MINUTE,
+      statistics: 'total_increasing',
+      displayPrecision: 1,
+    },
+    {
+      entity_id: 'sensor.solcast_pv_forecast_forecast_today',
+      attributes: { friendly_name: 'Solcast forecast today', unit_of_measurement: 'kWh', device_class: 'energy' },
+      state: (t) => num(model.solarForecast(localDay(m(t)), shiftMs).estimate, 4),
+      dynamicAttributes: (t) => ({ ...model.solarForecast(localDay(m(t)), shiftMs) }),
+      sampleMs: 30 * MINUTE,
     },
     {
       entity_id: 'binary_sensor.front_door',

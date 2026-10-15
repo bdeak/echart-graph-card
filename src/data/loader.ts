@@ -1,7 +1,8 @@
 import { fetchHistory, isBinaryEntity, isExternalStatistic, isValidEntityId, seriesValue } from './history';
 import { fetchStatistics, fetchStatisticsMetadata } from './statistics';
 import type { StatisticMetadata } from './statistics';
-import { applyTransform, bucketStart, bucketTimeZone, clipToWindow, groupBy, lastBucketTail, transformValue } from './transform';
+import { attributeSeriesPoints } from './list';
+import { applyTransform, bucketStart, bucketTimeZone, chartWindow, clipToWindow, groupBy, lastBucketTail, transformValue } from './transform';
 import { attributeUnit } from './units';
 import type { HomeAssistant, NormalizedConfig, NormalizedSeries, Point, SeriesData, StatisticsPeriod } from '../types';
 
@@ -9,7 +10,7 @@ const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
-type Source = 'history' | 'statistics';
+type Source = SeriesData['source'];
 
 /** Options of loadSeriesData. */
 export interface LoadOptions {
@@ -22,6 +23,7 @@ export interface LoadOptions {
 
 /**
  * Backend for one series before any fetch:
+ * - list attribute series (`value_key`) are read from hass.states (`attribute`, no fetch);
  * - external statistics (`source:id`) only exist in long-term statistics;
  * - attribute series always use history (statistics only exist for states);
  * - an explicit `statistic` column asks for statistics, whatever the window;
@@ -31,6 +33,7 @@ export interface LoadOptions {
  * - otherwise statistics.
  */
 function plannedSource(s: NormalizedSeries, cfg: NormalizedConfig, hass: HomeAssistant): Source {
+  if (s.valueKey !== undefined) return 'attribute';
   if (isExternalStatistic(s.entity)) return 'statistics';
   if (s.attribute) return 'history';
   if (s.statistic !== 'auto') return 'statistics';
@@ -148,9 +151,11 @@ function stateUnitOf(s: NormalizedSeries, hass: HomeAssistant): string | undefin
 }
 
 /**
- * Load every series of `cfg` for the window [now - cfg.spanMs, now].
+ * Load every series of `cfg` for its window (chartWindow: [now - cfg.spanMs, now], or aligned
+ * to `cfg.spanStart`); data is fetched up to `now`.
  *
  * Source selection (per series, see plannedSource):
+ * - attribute: list attribute series are read from hass.states (attributeSeriesPoints).
  * - history: one fetchHistory call for all state-based series (deduped entities), plus one call
  *   per distinct `attribute`.
  * - statistics: one fetchStatistics call (period cfg.statisticsPeriod) plus, in parallel, the
@@ -181,8 +186,8 @@ function stateUnitOf(s: NormalizedSeries, hass: HomeAssistant): string | undefin
  */
 export async function loadSeriesData(hass: HomeAssistant, cfg: NormalizedConfig, now: Date, opts: LoadOptions = {}): Promise<SeriesData[]> {
   const nowMs = now.getTime();
-  const windowStart = nowMs - cfg.spanMs;
   const zone = bucketTimeZone(hass);
+  const windowStart = chartWindow(cfg.spanMs, cfg.spanStart, nowMs, zone).start;
   const only = opts.only;
   const list = only ? cfg.series.filter((s) => only.has(s.key)) : cfg.series;
 
@@ -246,9 +251,27 @@ export async function loadSeriesData(hass: HomeAssistant, cfg: NormalizedConfig,
     }
   }
 
-  return list.map((s) =>
-    buildSeriesData(s, sources.get(s.key) ?? 'history', raw[s.key] ?? [], hass, cfg, meta, unitOverride.get(s.key), windowStart, zone),
-  );
+  return list.map((s) => {
+    const source = sources.get(s.key) ?? 'history';
+    if (source === 'attribute') return buildAttributeSeriesData(s, hass, windowStart, nowMs, zone);
+    return buildSeriesData(s, source, raw[s.key] ?? [], hass, cfg, meta, unitOverride.get(s.key), windowStart, zone);
+  });
+}
+
+function buildAttributeSeriesData(s: NormalizedSeries, hass: HomeAssistant, windowStart: number, now: number, zone: string | undefined): SeriesData {
+  const { points, latest, error } = attributeSeriesPoints(s, hass, windowStart, now, zone);
+  const friendly = nonEmpty(hass.states?.[s.entity]?.attributes?.friendly_name);
+  const data: SeriesData = {
+    series: s,
+    points,
+    unit: s.unit,
+    name: s.name ?? friendly ?? s.entity,
+    isBinary: false,
+    latest,
+    source: 'attribute',
+  };
+  if (error) data.error = error;
+  return data;
 }
 
 function buildSeriesData(

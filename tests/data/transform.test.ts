@@ -5,6 +5,7 @@ import {
   bucketRange,
   bucketStart,
   bucketTimeZone,
+  chartWindow,
   clipToWindow,
   groupBy,
   isValidTimeZone,
@@ -401,5 +402,29 @@ describe('clipToWindow', () => {
 
   it('keeps a single stale point (re-stamped) so the line still starts at the edge', () => {
     expect(clipToWindow([[0, 7]], 100, true)).toEqual([[100, 7]]);
+  });
+});
+
+describe('chartWindow', () => {
+  const now = Z('2026-09-26T12:00:00Z');
+
+  it('ends now without span.start', () => {
+    expect(chartWindow(D, null, now, BERLIN)).toEqual({ start: now - D, end: now });
+  });
+
+  it('starts at local midnight with span.start: day', () => {
+    expect(chartWindow(D, 'day', now, BERLIN)).toEqual({ start: Z('2026-09-25T22:00:00Z'), end: Z('2026-09-26T22:00:00Z') });
+    expect(chartWindow(12 * H, 'day', now, BERLIN)).toEqual({ start: Z('2026-09-25T22:00:00Z'), end: Z('2026-09-26T10:00:00Z') });
+    // 00:30 local is still the same day.
+    expect(chartWindow(D, 'day', Z('2026-09-25T22:30:00Z'), BERLIN).start).toBe(Z('2026-09-25T22:00:00Z'));
+  });
+
+  it('covers whole local days across DST changes (25 h / 23 h)', () => {
+    expect(chartWindow(D, 'day', Z('2026-10-25T12:00:00Z'), BERLIN)).toEqual({ start: Z('2026-10-24T22:00:00Z'), end: Z('2026-10-25T23:00:00Z') });
+    expect(chartWindow(D, 'day', Z('2026-03-29T12:00:00Z'), BERLIN)).toEqual({ start: Z('2026-03-28T23:00:00Z'), end: Z('2026-03-29T22:00:00Z') });
+  });
+
+  it('uses UTC midnight without a zone', () => {
+    expect(chartWindow(D, 'day', now, undefined)).toEqual({ start: Z('2026-09-26T00:00:00Z'), end: Z('2026-09-27T00:00:00Z') });
   });
 });

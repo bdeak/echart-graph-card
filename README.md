@@ -1,7 +1,8 @@
 # ECharts Graph Card
 
-Fast, clean time-series line charts for Home Assistant dashboards. It suits temperature,
-humidity, battery charge, power and energy, water, and anything else that changes over time.
+Fast, clean time-series line and bar charts for Home Assistant dashboards. It suits temperature,
+humidity, battery charge, power and energy, water, forecasts, and anything else that changes over
+time.
 
 `custom:echart-graph-card` is built on [Apache ECharts](https://echarts.apache.org/) and aims at
 three things:
@@ -39,6 +40,12 @@ series:
   - Binary sensors (and doors, locks, covers, people) are drawn as 0/1 step lines.
   - History lines extend to "now", and a value that did not change for a long time is drawn
     flat instead of as a slow ramp (Home Assistant only records changes).
+- **Bars, forecasts and day windows.**
+  - `type: bar` draws one bar per hour (or any bucket), e.g. energy per hour from statistics.
+  - `value_key` plots list attributes such as Solcast's `detailedForecast` or a price list,
+    read live from the entity.
+  - `span: { start: day }` shows today from midnight to midnight, including the forecast for
+    the rest of the day.
 - **Multiple y-axes.** Series are assigned to axes by unit automatically. You can also configure
   axes yourself with hard or *soft* bounds, a side, and a precision.
 - **Styling.**
@@ -54,7 +61,7 @@ series:
   - Uses the number and time formats of your language.
   - Supports the sections layout and the card picker.
   - Clicking a value opens the more-info dialog.
-- **Self-contained.** It ships a tree-shaken ECharts build (the whole card is about 225 kB gzipped) and does not
+- **Self-contained.** It ships a tree-shaken ECharts build (the whole card is about 240 kB gzipped) and does not
   depend on HA's internal chart elements, so it works on every dashboard.
 
 ## Installation
@@ -156,7 +163,7 @@ as `var(--accent-color)`.
 | `series` | list | **required** | The series to plot (see [Series](#series-options)). A bare entity id is shorthand for `{ entity: <id> }`. `entities` is accepted as an alias. |
 | `title` | string | – | Card title. |
 | `hours_to_show` | number | `24` | Window length in hours. Ignored when `span` is set. |
-| `span` | duration | – | Window length, e.g. `2h` or `7d`. Takes precedence over `hours_to_show`. |
+| `span` | duration \| `{ start: day, duration }` | – | Window length, e.g. `2h` or `7d`. Takes precedence over `hours_to_show`. As an object the window starts at local midnight instead of ending now: `span: { start: day }` is today 00:00–24:00 (also on 23 h / 25 h DST days). `duration` defaults to `hours_to_show`, else 24 h. The card reloads when a new day begins. |
 | `height` | number \| CSS length | `220px` | Chart height; a number means px. Other units: `rem`, `em`, `vh`, `vw` and the like. `%` and `auto` are not supported. In the sections layout see [below](#sections-layout). |
 | `data_source` | `auto` \| `history` \| `statistics` | `auto` | `auto` uses recorder history for windows up to 72 h and long-term statistics above that (or whenever `statistics_period` is set). In `auto` mode, entities without statistics (no `state_class`) fall back to history. External statistics (`source:id`) and series with an explicit `statistic` always use statistics. |
 | `statistics_period` | `5minute` \| `hour` \| `day` \| `week` \| `month` | by span | Statistics bucket size. The default is `5minute` for windows up to 2 d, `hour` up to 31 d, and `day` above that. Setting it with `data_source: auto` makes the card use statistics for any window. HA keeps 5-minute statistics only for the recorder's purge window (10 days by default). |
@@ -188,10 +195,13 @@ as `var(--accent-color)`.
 | `color` | colour | palette | Line colour. Defaults to the built-in 10-colour palette by position. |
 | `unit` | string | entity unit | Overrides `unit_of_measurement`. Also used for axis matching. Set it for `attribute` series (except climate temperatures / humidity, see below) and whenever `transform` changes the unit. |
 | `y_axis` | string | auto | `y_axes[].id` to plot on. By default a series uses the configured axis with the same unit, otherwise an automatic axis for its unit. |
-| `attribute` | string | – | Plot this attribute instead of the state, e.g. a climate entity's `temperature` setpoint. It always comes from history, because statistics only exist for states. Attributes have no unit in Home Assistant: temperature attributes of `climate` / `water_heater` entities get your temperature unit and humidity attributes `%`; set `unit` for anything else. |
+| `attribute` | string | – | Plot this attribute instead of the state, e.g. a climate entity's `temperature` setpoint. It always comes from history, because statistics only exist for states. Attributes have no unit in Home Assistant: temperature attributes of `climate` / `water_heater` entities get your temperature unit and humidity attributes `%`; set `unit` for anything else. With `value_key` the attribute is read as a list instead. |
+| `value_key` | string | – | Plot a list attribute (see [List attributes](#list-attributes)): each item of `attribute` becomes a point, with this key as its value. |
+| `time_key` | string | auto | With `value_key`: the item key holding its time. Default: the first of `period_start`, `start`, `start_time`, `startsAt`, `datetime`, `time`, `from` that the items have. |
+| `type` | `line` \| `bar` | `line` | `bar` draws one bar per bucket (see [Bars](#bars)). `column` is accepted as an alias. |
 | `line` | [line](#line) | | Width, smoothing, steps, dash style. |
-| `fill` | `none` \| `solid` \| `gradient` | `gradient` for 1–2 series, else `none` (and `none` with 2+ `color_thresholds` stops) | Area fill under the line. |
-| `fill_opacity` | 0..1 | gradient `0.35`, solid `0.2` | Fill strength. For gradients this is the opacity at the line; it fades to 0 at the baseline. |
+| `fill` | `none` \| `solid` \| `gradient` | `gradient` for 1–2 series, else `none` (and `none` with 2+ `color_thresholds` stops); bars `solid` | Area fill under the line. For bars: the bar's fill (`none` = outline only). |
+| `fill_opacity` | 0..1 | gradient `0.35`, solid `0.2`, bars `0.45` | Fill strength. For gradients this is the opacity at the line; it fades to 0 at the baseline. |
 | `group_by` | duration \| [group_by](#group_by) \| `false` | card `group_by` | Per-series bucketing. `"5m"` means `{ func: avg, duration: 5m }`. `false` ignores the card-level default. |
 | `transform` | `{ multiply, offset }` | `{ multiply: 1, offset: 0 }` | Applied to every value as `value * multiply + offset`, e.g. `multiply: 0.001` with `unit: kW` for W to kW, or `multiply: -1` to invert. The unit is not changed for you. |
 | `color_thresholds` | list of [color_thresholds](#color_thresholds) | – | Colour the line (and fill) by value. |
@@ -204,7 +214,7 @@ as `var(--accent-color)`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `width` | `2` (binary: `1.5`) | Stroke width in px. |
+| `width` | `2` (binary: `1.5`, bars: `1`) | Stroke width in px. For bars: the border width (`0` = none). |
 | `smooth` | `true` | `true`/`false`, or a smoothness factor 0..1 (`true` = 0.35). Always off for stepped lines. |
 | `step` | auto | `true` (= `end`), `start`, `middle`, `end` or `false`. Auto uses `end` for binary sensors and no steps otherwise. `end` is the right choice for sample-and-hold sensor data and for bucketed values. |
 | `style` | `solid` | `solid`, `dashed` or `dotted`. |
@@ -225,11 +235,56 @@ group_by: { func: max, duration: 1h }
 | `delta` | Last value minus the value at the bucket start, e.g. meter increase per hour. Consecutive deltas add up to the total increase. |
 | `median` | Median of the samples in the bucket. |
 
-Each bucket is plotted at its start time. Buckets of 1 h and shorter start at round clock times, e.g. 5 m buckets at :00, :05 and so on, in whole-hour time zones. Longer
+Each bucket is plotted at its start time (at its centre in a card with bars, see [Bars](#bars)). Buckets of 1 h and shorter start at round clock times, e.g. 5 m buckets at :00, :05 and so on, in whole-hour time zones. Longer
 ones (2 h, 3 h, 4 h, 6 h, 8 h, 12 h, days, weeks from Monday) align to local wall-clock time in
 the display time zone. Buckets with only `unavailable` samples stay gaps. Empty buckets between
 two samples repeat the held value (0 for `sum`/`delta`). Grouping applies to live data too: the
 current bucket is re-aggregated as new states arrive.
+
+### Bars
+
+```yaml
+statistics_period: hour
+series:
+  - entity: sensor.solar_energy_today   # a total_increasing kWh counter
+    type: bar
+    statistic: change                   # energy per hour
+```
+
+A bar covers one bucket: a statistics row (`statistics_period`), a `group_by` bucket, or a list
+attribute item. It is drawn centred on its bucket, 72 % of it wide, in the series colour with a
+translucent fill and a 1 px border. Hours with 0 draw no bar, and an axis with bars starts at 0
+unless you set its `min`. Several bar series stand side by side. In a card with bars, bucketed
+lines (statistics, `group_by`, list attributes; not stepped) are drawn at their bucket centres
+too, so a forecast line peaks over the bar of the same hour. Hovering a bar shows its range
+("08:00 – 09:00") in the tooltip.
+
+Bars need buckets: bars of raw history (no `group_by`, no `statistic`) get a warning. For a
+current hour that fills in during the hour, use 5-minute statistics summed per hour:
+`statistics_period: 5minute` plus `group_by: { func: sum, duration: 1h }` on the series.
+
+### List attributes
+
+Some integrations keep a whole series in one attribute: Solcast's `detailedForecast`, energy
+price lists, tariff schedules. `value_key` plots such a list:
+
+```yaml
+series:
+  - entity: sensor.solcast_pv_forecast_forecast_today
+    attribute: detailedForecast   # [{ period_start, pv_estimate, pv_estimate10, ... }, ...]
+    value_key: pv_estimate        # kW per half hour
+    group_by: { func: avg, duration: 1h }   # average kW per hour = kWh per hour
+    unit: kWh
+```
+
+- The list is read from the entity's **current** state, not from history, and re-read every time
+  the entity changes. Items before the window are dropped; items after it (tomorrow) are not drawn.
+- Each item is valid until the next one: the tooltip shows the item covering the hovered time.
+- Times can be ISO strings or epoch seconds / milliseconds. Values go through the usual number
+  parsing; anything non-numeric is a gap. `transform` and `group_by` apply as usual.
+- Set `unit`: list items have none.
+- The header chip shows the item (bucket) covering now. For forecasts that is rarely what you
+  want in the header; `show_in_header: false` moves the series to the legend.
 
 ### `y_axes`
 
@@ -296,8 +351,10 @@ color_thresholds:
 
 ## How it behaves
 
-- **Window.** The x-axis always covers `[now - span, now]` and moves forward every minute.
-  History lines are extended to "now" with the last known value.
+- **Window.** The x-axis covers `[now - span, now]` and moves forward every minute. With
+  `span: { start: day }` it covers the local day instead, and the part after now stays empty
+  (except for list attributes such as forecasts). History lines are extended to "now" with the
+  last known value.
 - **Live updates** (`update: live`). New states from Home Assistant are appended as they arrive,
   without any request to the recorder. Redraws are throttled to about one per second.
   Statistics-based series update only their header value until Home Assistant has compiled the
@@ -342,11 +399,13 @@ the header leaves.
 | apexcharts-card | echart-graph-card |
 | --- | --- |
 | `graph_span: 2h` | `span: 2h` |
-| `span: { start/end/offset }` | Not supported. The window always ends now. |
+| `span: { start: day }` | `span: { start: day }` (with `graph_span` → `span.duration`); `end`, `offset` and other `start` values are not supported |
 | `header: { show, title, show_states }` | `title:` and `show: { header_states: true }` |
 | `update_interval: 60s` | `update: 60s` (the default is live) |
 | `series[].name` / `color` / `unit` | same |
-| `series[].type: line` / `area` | `line` plus `fill: gradient \| solid \| none` (column charts are not supported) |
+| `series[].type: line` / `area` | `line` plus `fill: gradient \| solid \| none` |
+| `series[].type: column` | `type: bar` |
+| `series[].data_generator` reading an attribute list | `attribute` + `value_key` (+ `time_key`), see [List attributes](#list-attributes) |
 | `series[].stroke_width` | `line.width` |
 | `series[].curve: smooth \| straight \| stepline` | `line.smooth: true`, `line.smooth: false`, `line.step: true` |
 | `series[].stroke_dash` | `line.style: dashed \| dotted` |
@@ -423,6 +482,8 @@ against a mock `hass` object (`dev/mock-hass.ts`):
   - grid, solar and battery power, with the battery controller holding the grid near 40 W, so
     values go negative on charge and export
   - a `total_increasing` water meter, a door sensor, and a thermostat with a setpoint attribute
+  - a daily PV energy counter and a Solcast-like forecast sensor with a `detailedForecast` list
+    (P10 / P50 / P90 per half hour)
   - diurnal and seasonal curves, noise, and `unavailable` / `unknown` gaps
 - **WebSocket:** `callWS` answers `history/history_during_period`,
   `recorder/statistics_during_period` and `recorder/get_statistics_metadata` in HA's wire

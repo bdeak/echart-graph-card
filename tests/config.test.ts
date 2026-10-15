@@ -66,6 +66,7 @@ describe('normalizeConfig: defaults', () => {
       key: '0:sensor.temp',
       entity: 'sensor.temp',
       attribute: undefined,
+      type: 'line',
       name: undefined,
       color: DEFAULT_PALETTE[0],
       unit: undefined,
@@ -414,5 +415,72 @@ describe('normalizeConfig: friendly errors', () => {
 
   it('rejects non-object configs', () => {
     expect(() => normalizeConfig(null as unknown as CardConfig)).toThrow(/Invalid config: expected an object/);
+  });
+});
+
+describe('normalizeConfig: span: { start: day }', () => {
+  it('aligns to the day, 24h by default', () => {
+    expect(cfg({ span: { start: 'day' } })).toMatchObject({ spanMs: DAY, spanStart: 'day' });
+    expect(cfg({ span: '12h' })).toMatchObject({ spanMs: 12 * HOUR, spanStart: null });
+  });
+
+  it('takes its length from duration, else hours_to_show', () => {
+    expect(cfg({ span: { start: 'day', duration: '2d' } }).spanMs).toBe(2 * DAY);
+    expect(cfg({ span: { start: 'day', duration: 12 } }).spanMs).toBe(12 * HOUR);
+    expect(cfg({ span: { start: 'day' }, hours_to_show: 48 }).spanMs).toBe(48 * HOUR);
+  });
+
+  it('rejects a missing or unknown start and warns about unknown keys', () => {
+    expect(bad({ series: ['sensor.a'], span: {} })).toThrow(/span\.start is required/);
+    expect(bad({ series: ['sensor.a'], span: { start: 'week' } })).toThrow(/span\.start must be one of day/);
+    expect(bad({ series: ['sensor.a'], span: { start: 'day', duration: 0 } })).toThrow(/span\.duration must be > 0/);
+    expect(cfg({ span: { start: 'day', offset: '-1d' } as never }).warnings).toEqual([
+      'Unknown option "span.offset" is ignored (not supported)',
+    ]);
+  });
+});
+
+describe('normalizeConfig: series type', () => {
+  it('defaults to line; bars get a solid fill and a 1px border', () => {
+    const c = cfg({ statistics_period: 'hour', series: [{ entity: 'sensor.a', type: 'bar', statistic: 'change' }, 'sensor.b'] });
+    expect(c.series[0]).toMatchObject({ type: 'bar', fill: 'solid', fillOpacity: DEFAULTS.barOpacity, line: { width: 1 } });
+    expect(c.series[1]).toMatchObject({ type: 'line', fill: 'gradient' });
+    expect(c.warnings).toEqual([]);
+  });
+
+  it('keeps explicit bar fill / width and accepts column as an alias', () => {
+    const c = cfg({ series: [{ entity: 'sensor.a', type: 'column', fill: 'gradient', line: { width: 0 }, group_by: '1h' }] });
+    expect(c.series[0]).toMatchObject({ type: 'bar', fill: 'gradient', fillOpacity: DEFAULTS.barOpacity, line: { width: 0 } });
+  });
+
+  it('rejects other types, with a hint for area', () => {
+    expect(bad({ series: [{ entity: 'sensor.a', type: 'area' }] })).toThrow(/fill: solid or gradient/);
+    expect(bad({ series: [{ entity: 'sensor.a', type: 'pie' }] })).toThrow(/type must be one of line, bar/);
+  });
+
+  it('warns about bars of raw history (no bucket width)', () => {
+    expect(cfg({ series: [{ entity: 'sensor.a', type: 'bar' }] }).warnings).toEqual([
+      'series[0]: bars of raw history have no bucket width; set group_by (e.g. 1h) or a statistic (e.g. change)',
+    ]);
+    expect(cfg({ span: '7d', series: [{ entity: 'sensor.a', type: 'bar' }] }).warnings).toEqual([]);
+  });
+});
+
+describe('normalizeConfig: list attributes (value_key)', () => {
+  it('needs attribute; time_key needs value_key', () => {
+    expect(bad({ series: [{ entity: 'sensor.f', value_key: 'pv_estimate' }] })).toThrow(/value_key needs attribute/);
+    expect(bad({ series: [{ entity: 'sensor.f', attribute: 'a', time_key: 't' }] })).toThrow(/time_key only applies together with value_key/);
+  });
+
+  it('keeps the keys and makes series keys unique per value key', () => {
+    const c = cfg({
+      series: [
+        { entity: 'sensor.f', attribute: 'detailedForecast', value_key: 'pv_estimate' },
+        { entity: 'sensor.f', attribute: 'detailedForecast', value_key: 'pv_estimate10', time_key: 'period_start' },
+      ],
+    });
+    expect(c.series[0]).toMatchObject({ key: '0:sensor.f#detailedForecast[pv_estimate]', valueKey: 'pv_estimate', timeKey: undefined });
+    expect(c.series[1]).toMatchObject({ key: '1:sensor.f#detailedForecast[pv_estimate10]', timeKey: 'period_start' });
+    expect(c.warnings).toEqual([]);
   });
 });

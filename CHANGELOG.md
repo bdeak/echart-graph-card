@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-15
+
+### Added
+
+- Bar series: `type: bar` (alias `column`). One bar per bucket (statistics row, `group_by`
+  bucket or list item), centred on it, with a translucent fill, a 1 px border and rounded top
+  corners. Zero values draw no bar; an auto axis with bars starts at 0. In cards with bars,
+  bucketed lines are drawn at bucket centres, and the tooltip header shows the hovered bar's range.
+- List attribute series: `attribute` + `value_key` (+ optional `time_key`) plot a list held in
+  one attribute, e.g. Solcast's `detailedForecast` or an energy price list. Read from the current
+  state (no history call) and re-read on every change of the entity.
+- Day-aligned window: `span: { start: day, duration? }` shows the local day from midnight
+  (23 h / 25 h on DST days) and may reach into the future; the card reloads when a new day begins.
+- Example `examples/solar_forecast.yaml` (hourly PV energy with the Solcast P10 / P50 / P90
+  forecast) and matching mock entities in the dev harness.
+
 ## [0.1.0] - unreleased
 
 First version.
