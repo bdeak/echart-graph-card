@@ -3,6 +3,8 @@
 # is visible. Bars: hourly change of the inverter's daily counter from 5-minute statistics,
 # summed per hour (the current hour fills in every 5 minutes). Forecast lines: Solcast's
 # detailedForecast attribute (average kW per half hour), averaged per hour = kWh per hour.
+# Header: today's production so far, and Expected = Solcast's total for today as a value-only
+# chip (show_in_chart: false: not drawn, no toggle).
 type: custom:echart-graph-card
 title: Solar production
 span:
@@ -58,3 +60,7 @@ series:
     fill: none
     precision: 2
     show_in_header: false
+  - entity: sensor.solcast_pv_forecast_forecast_today
+    name: Expected
+    show_in_chart: false
+    precision: 1

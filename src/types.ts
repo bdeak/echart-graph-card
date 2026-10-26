@@ -240,6 +240,12 @@ export interface SeriesConfig {
   precision?: number;
   /** Show a chip for this series in the header. Default true. */
   show_in_header?: boolean;
+  /**
+   * Draw the series in the chart. `false` makes a value-only header chip: the entity's current
+   * value, never fetched or drawn, no axis, legend or tooltip entry, and no show/hide toggle.
+   * Default true.
+   */
+  show_in_chart?: boolean;
   /** Start with this series hidden (toggleable via header chip / legend). Default false. */
   hidden?: boolean;
 }
@@ -351,6 +357,8 @@ export interface NormalizedSeries {
   /** Explicit decimals, undefined = entity display_precision or auto. */
   precision?: number;
   showInHeader: boolean;
+  /** false = value-only header chip (in NormalizedConfig.valueSeries, never in `series`). */
+  showInChart: boolean;
   hidden: boolean;
 }
 
@@ -441,6 +449,13 @@ export interface NormalizedConfig {
   thresholds: NormalizedThreshold[];
   /** Non-empty. */
   series: NormalizedSeries[];
+  /**
+   * Value-only header chips (`show_in_chart: false`): own index / key space ("v<i>:..."), never
+   * loaded, drawn or toggled.
+   */
+  valueSeries: NormalizedSeries[];
+  /** The header chips in config order: drawn series with show_in_header, then value-only ones in place. Empty with show.header_states false. */
+  headerSeries: NormalizedSeries[];
   /** The original config object (for getCardSize/getGridOptions heuristics, debugging). */
   raw: CardConfig;
   /**

@@ -222,7 +222,7 @@ export class EchartGraphCard extends LitElement {
 
     this._config = cfg;
     this._wantSig = sig;
-    this._trackedEntities = [...new Set(cfg.series.map((s) => s.entity))];
+    this._trackedEntities = [...new Set([...cfg.series, ...cfg.valueSeries].map((s) => s.entity))];
     const hidden = new Set(cfg.series.filter((s) => s.hidden).map((s) => s.key));
     if (!sameSet(hidden, this._hiddenKeys)) this._hiddenKeys = hidden;
 
@@ -251,7 +251,7 @@ export class EchartGraphCard extends LitElement {
     const px = cfg && /^\d+(\.\d+)?px$/.test(cfg.height) ? Number.parseFloat(cfg.height) : Number.parseFloat(DEFAULTS.height);
     let size = Math.ceil(px / 50);
     if (cfg) {
-      const chips = cfg.show.headerStates ? cfg.series.filter((s) => s.showInHeader).length : 0;
+      const chips = cfg.headerSeries.length;
       if (chips === 1) size += 1; // title + hero value share one row
       else size += (cfg.title ? 1 : 0) + (chips > 1 ? 1 : 0);
     }

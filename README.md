@@ -208,6 +208,7 @@ as `var(--accent-color)`.
 | `statistic` | `mean` \| `min` \| `max` \| `sum` \| `state` \| `change` | auto | Statistics column to plot. Auto picks `state` for `total` / `total_increasing` entities (meters) and `mean` otherwise. Use `change` for "consumption per period". Setting it makes this series use long-term statistics for any window, without falling back to history. |
 | `precision` | 0..10 | display precision | Decimals in the header and tooltip. Defaults to the entity's display precision, otherwise it is chosen from the value. |
 | `show_in_header` | boolean | `true` | Show a header chip for this series. |
+| `show_in_chart` | boolean | `true` | `false` makes a value-only header chip: the entity's current value (or plain `attribute`), in its config position, without dot or show/hide toggle. It is never fetched or drawn and gets no axis, legend or tooltip entry, e.g. a day's forecast total next to the hourly bars. Chart-only options (`type`, `line`, `fill`, `y_axis`, `group_by`, `statistic`, `hidden`, …) are ignored with a warning; it cannot be combined with `value_key`, an external statistic or `show_in_header: false`, and at least one series must be drawn. |
 | `hidden` | boolean | `false` | Start hidden. Clicking the header chip or legend entry shows it. |
 
 ### `line`
@@ -414,7 +415,7 @@ the header leaves.
 | `series[].invert: true` | `transform: { multiply: -1 }` |
 | `series[].statistics: { type, period }` | card `data_source: statistics`, `statistics_period`, series `statistic` |
 | `series[].show: { in_header: false }` | `show_in_header: false` |
-| `series[].show: { legend_value, in_chart }` | `show.legend`; use `hidden: true` to start hidden |
+| `series[].show: { legend_value, in_chart }` | `show.legend`; `in_chart: false` → `show_in_chart: false` (value only in the header); use `hidden: true` to start hidden |
 | `series[].float_precision` | `precision` |
 | `series[].color_threshold` | `color_thresholds` |
 | `series[].extend_to: now` | automatic for history series |

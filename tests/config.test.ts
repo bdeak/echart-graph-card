@@ -80,8 +80,11 @@ describe('normalizeConfig: defaults', () => {
       statistic: 'auto',
       precision: undefined,
       showInHeader: true,
+      showInChart: true,
       hidden: false,
     });
+    expect(c.valueSeries).toEqual([]);
+    expect(c.headerSeries).toEqual([c.series[0]]);
   });
 
   it('keeps the raw config', () => {
@@ -482,5 +485,56 @@ describe('normalizeConfig: list attributes (value_key)', () => {
     expect(c.series[0]).toMatchObject({ key: '0:sensor.f#detailedForecast[pv_estimate]', valueKey: 'pv_estimate', timeKey: undefined });
     expect(c.series[1]).toMatchObject({ key: '1:sensor.f#detailedForecast[pv_estimate10]', timeKey: 'period_start' });
     expect(c.warnings).toEqual([]);
+  });
+});
+
+describe('normalizeConfig: show_in_chart (value-only header chips)', () => {
+  const F = { entity: 'sensor.forecast_today', name: 'Expected', show_in_chart: false };
+
+  it('splits value-only series off; drawn series keep contiguous indices and palette colours', () => {
+    const c = cfg({ series: ['sensor.a', F, 'sensor.b'] });
+    expect(c.series.map((s) => [s.index, s.key, s.color])).toEqual([
+      [0, '0:sensor.a', DEFAULT_PALETTE[0]],
+      [1, '1:sensor.b', DEFAULT_PALETTE[1]],
+    ]);
+    expect(c.valueSeries).toHaveLength(1);
+    expect(c.valueSeries[0]).toMatchObject({ index: 0, key: 'v0:sensor.forecast_today', showInChart: false, hidden: false, color: 'var(--secondary-text-color)' });
+    expect(c.headerSeries.map((s) => s.key)).toEqual(['0:sensor.a', 'v0:sensor.forecast_today', '1:sensor.b']);
+    expect(c.series.every((s) => s.showInChart)).toBe(true);
+    expect(c.warnings).toEqual([]);
+  });
+
+  it('does not change the drawn series defaults (fill by drawn count) and keeps an explicit colour', () => {
+    const c = cfg({ series: ['sensor.a', { ...F, color: '#ff9800' }] });
+    expect(c.series[0].fill).toBe('gradient');
+    expect(c.valueSeries[0].color).toBe('#ff9800');
+  });
+
+  it('the drawn chip toggles normally next to a value-only chip (no hero, no extra legend)', () => {
+    expect(cfg({ series: [{ entity: 'sensor.a', hidden: true }, F] }).show).toMatchObject({ legend: false });
+    // Without the value-only chip the lone hidden series is a hero and needs the legend.
+    expect(cfg({ series: [{ entity: 'sensor.a', hidden: true }] }).show).toMatchObject({ legend: true });
+  });
+
+  it('rejects combinations that would show nothing or cannot work', () => {
+    expect(bad({ series: ['sensor.a', { ...F, show_in_header: false }] })).toThrow(/series\[1\]\.show_in_chart false shows the series only in the header/);
+    expect(bad({ series: ['sensor.a', { ...F, attribute: 'detailedForecast', value_key: 'pv_estimate' }] })).toThrow(/series\[1\]\.value_key cannot be combined with show_in_chart: false/);
+    expect(bad({ series: ['sensor.a', { entity: 'sensor:energy_total', show_in_chart: false }] })).toThrow(/needs a live entity state/);
+    expect(bad({ series: [F] })).toThrow(/series needs at least one series drawn in the chart/);
+    expect(bad({ series: ['sensor.a', { entity: 'sensor.b', show_in_chart: 'no' }] })).toThrow(/series\[1\]\.show_in_chart must be true or false/);
+  });
+
+  it('warns about chart-only options and about header_states: false', () => {
+    const c = cfg({ series: ['sensor.a', { ...F, type: 'bar', y_axis: undefined, hidden: true, line: { width: 1 } }] });
+    expect(c.warnings).toEqual(['series[1]: type, line, hidden ignored with show_in_chart: false (the series is not drawn)']);
+    expect(c.valueSeries[0].hidden).toBe(false);
+    const h = cfg({ series: ['sensor.a', F], show: { header_states: false } });
+    expect(h.headerSeries).toEqual([]);
+    expect(h.warnings).toEqual(['show.header_states: false hides the series with show_in_chart: false (they only appear in the header)']);
+  });
+
+  it('an attribute value works (plain attribute, no list)', () => {
+    const c = cfg({ series: ['sensor.a', { entity: 'climate.x', attribute: 'temperature', show_in_chart: false }] });
+    expect(c.valueSeries[0]).toMatchObject({ key: 'v0:climate.x#temperature', attribute: 'temperature' });
   });
 });

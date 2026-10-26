@@ -810,6 +810,63 @@ describe('header chips', () => {
   });
 });
 
+describe('value-only chips (show_in_chart: false)', () => {
+  const FORECAST = 'sensor.solar_forecast_today';
+  const hass = (forecast = '4.8'): HomeAssistant =>
+    makeHass([
+      entity(TEMP, '21.5', { unit_of_measurement: '°C', friendly_name: 'Temperature' }),
+      entity(FORECAST, forecast, { unit_of_measurement: 'kWh', friendly_name: 'Forecast today' }),
+    ]);
+  const config = (extra: Record<string, unknown> = {}): CardConfig => ({
+    type: 'custom:echart-graph-card',
+    series: [{ entity: TEMP, name: 'Temp' }, { entity: FORECAST, name: 'Expected', show_in_chart: false, precision: 1, ...extra }],
+  });
+
+  it('renders a plain value chip in config order: no dot, no toggle, never struck through', async () => {
+    const el = await mount(config({ hidden: true }), hass());
+    const chips = qa(el, '.chip');
+    expect(chips).toHaveLength(2);
+    const v = chips[1];
+    expect(v.classList.contains('value-only')).toBe(true);
+    expect(v.classList.contains('off')).toBe(false);
+    expect(v.querySelector('.chip-toggle')).toBeNull();
+    expect(v.querySelector('.dot')).toBeNull();
+    expect(v.querySelector('.name')?.textContent).toBe('Expected');
+    expect(v.querySelector('.chip-value')?.textContent?.trim()).toBe('4.8 kWh');
+    // The drawn series still has its normal toggle chip (no hero layout).
+    expect(chips[0].querySelector('.chip-toggle')).not.toBeNull();
+    expect(q(el, '.hero')).toBeNull();
+  });
+
+  it('is never loaded or drawn', async () => {
+    await mount(config(), hass());
+    const cfg0 = loadMock.mock.calls[0][1] as NormalizedConfig;
+    expect(cfg0.series.map((s) => s.entity)).toEqual([TEMP]);
+    const built = buildMock.mock.calls[buildMock.mock.calls.length - 1];
+    expect((built[1] as SeriesData[]).map((d) => d.series.entity)).toEqual([TEMP]);
+  });
+
+  it('follows the entity live and opens more-info on tap', async () => {
+    vi.useFakeTimers({ now: T0 + 60_000, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    const hs = hass();
+    const el = await mount(config(), hs);
+    el.hass = withStates(hs, entity(FORECAST, '5.26', { unit_of_measurement: 'kWh', friendly_name: 'Forecast today' }, T0 + 61_000));
+    await vi.advanceTimersByTimeAsync(0);
+    await settle(el);
+    expect(qa(el, '.chip')[1].querySelector('.chip-value')?.textContent?.trim()).toBe('5.3 kWh');
+    const seen: unknown[] = [];
+    document.addEventListener('hass-more-info', (e) => seen.push((e as CustomEvent).detail), { once: true });
+    qa(el, '.chip')[1].querySelector<HTMLButtonElement>('.chip-value')!.click();
+    expect(seen).toEqual([{ entityId: FORECAST }]);
+  });
+
+  it('counts as a header chip for the card size', async () => {
+    const el = await mount(config(), hass());
+    const one = await mount({ type: 'custom:echart-graph-card', series: [TEMP] }, hass());
+    expect(el.getCardSize()).toBe(one.getCardSize()); // hero row vs. chip row: both one extra row
+  });
+});
+
 describe('header helpers', () => {
   it('computeExtrema is time-weighted and window-bounded', () => {
     const pts: Point[] = [

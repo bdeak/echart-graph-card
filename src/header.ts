@@ -60,6 +60,8 @@ interface ChipModel {
   heroUnit?: string;
   color: string;
   hidden: boolean;
+  /** show_in_chart: false — a plain value: no dot, no show/hide toggle. */
+  valueOnly: boolean;
   extrema?: { min: string; max: string; avg: string };
 }
 
@@ -213,6 +215,7 @@ function buildChip(
     heroUnit,
     color: thresholdColor(value, series.colorThresholds) ?? series.color,
     hidden,
+    valueOnly: !series.showInChart,
     extrema,
   };
 }
@@ -260,6 +263,17 @@ function renderChip(chip: ChipModel, opts: HeaderOptions): TemplateResult {
   };
   const tip = `${chip.name}: ${chip.text}`;
   const valueContent = html`${chip.text}${chip.extrema ? renderExtrema(chip.extrema, 'chip-ext') : nothing}`;
+  const valueEl = chip.known
+    ? html`<button class="chip-value" title=${tip} @click=${moreInfoHandler(chip.entityId, opts)}>${valueContent}</button>`
+    : html`<span class="chip-value" title=${tip}>${valueContent}</span>`;
+  if (chip.valueOnly) {
+    // Nothing is drawn, so there is nothing to show or hide: a label and the value.
+    return html`
+      <div class="chip value-only" data-key=${chip.series.key} style=${styleMap({ '--chip-color': chip.color })}>
+        <span class="chip-label"><span class="name">${chip.name}</span></span>${valueEl}
+      </div>
+    `;
+  }
   return html`
     <div class="chip ${chip.hidden ? 'off' : ''}" data-key=${chip.series.key} style=${styleMap({ '--chip-color': chip.color })}>
       <button
@@ -270,9 +284,7 @@ function renderChip(chip: ChipModel, opts: HeaderOptions): TemplateResult {
       >
         <span class="dot"></span><span class="name">${chip.name}</span>
       </button>
-      ${chip.known
-        ? html`<button class="chip-value" title=${tip} @click=${moreInfoHandler(chip.entityId, opts)}>${valueContent}</button>`
-        : html`<span class="chip-value" title=${tip}>${valueContent}</span>`}
+      ${valueEl}
     </div>
   `;
 }
@@ -285,6 +297,8 @@ function renderChip(chip: ChipModel, opts: HeaderOptions): TemplateResult {
  * The value is read from hass.states on every render (so it is current in every update
  * mode), transform applied; binary / text / unavailable states show the (localized) state.
  * A single chip renders as a large "hero" value next to the title. Hidden series render dimmed.
+ * Value-only series (`show_in_chart: false`, cfg.valueSeries) get a chip in their config position
+ * without dot or toggle; their value comes from hass.states like any other chip.
  * When cfg.show.extrema, each chip adds min / max / avg of its visible-window points.
  * Chips are buttons (keyboard accessible): dot+name calls opts.onToggle(series.key), the
  * value opens more-info (`hass-more-info`).
@@ -302,14 +316,13 @@ export function renderHeader(
   const now = opts.now ?? Date.now();
   const start = opts.start ?? now - cfg.spanMs;
 
-  const chips: ChipModel[] = cfg.show.headerStates
-    ? cfg.series
-        .filter((s) => s.showInHeader)
-        .map((s) => {
-          const d = data[s.index]?.series.key === s.key ? data[s.index] : undefined;
-          return buildChip(s, d, hass, cfg, hiddenKeys.has(s.key), now, start);
-        })
-    : [];
+  // Chips in config order; older normalized configs (tests, embedders) have no headerSeries.
+  const headerSeries = cfg.headerSeries ?? (cfg.show.headerStates ? cfg.series.filter((s) => s.showInHeader) : []);
+  const chips: ChipModel[] = headerSeries.map((s) => {
+    if (!s.showInChart) return buildChip(s, undefined, hass, cfg, false, now, start);
+    const d = data[s.index]?.series.key === s.key ? data[s.index] : undefined;
+    return buildChip(s, d, hass, cfg, hiddenKeys.has(s.key), now, start);
+  });
 
   if (chips.length === 1) return renderHero(cfg, chips[0], opts);
   if (!cfg.title && chips.length === 0) return html``;
@@ -518,5 +531,13 @@ export const headerStyles = css`
 
   .chip.off .name {
     text-decoration: line-through;
+  }
+
+  /* show_in_chart: false — a value, not a series: no dot, no toggle, neutral tint by default. */
+  .chip-label {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    padding: 4px 4px 4px 10px;
   }
 `;

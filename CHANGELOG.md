@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-26
+
+### Added
+
+- Value-only header chips: `show_in_chart: false` on a series shows the entity's current value
+  in the header (in its config position, no dot, no show/hide toggle, never struck through) and
+  nothing in the chart: it is not fetched or drawn and gets no axis, legend or tooltip entry.
+  Typical use: a day's forecast total next to hourly bars. apexcharts-card's
+  `show: { in_chart: false }` maps to it.
+- `examples/solar_forecast.yaml` shows the forecast total for today as such a chip.
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

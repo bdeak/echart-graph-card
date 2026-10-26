@@ -271,6 +271,7 @@ const KNOWN = {
     'statistic',
     'precision',
     'show_in_header',
+    'show_in_chart',
     'hidden',
   ],
   show: ['legend', 'tooltip', 'header_states', 'zoom', 'extrema', 'points', 'x_axis', 'y_axis'],
@@ -320,7 +321,7 @@ const HINTS: Record<keyof typeof KNOWN, Record<string, string>> = {
     extend_to: 'not needed, history lines always extend to now',
     statistics: 'use data_source / statistics_period on the card and statistic on the series',
     opacity: 'use fill_opacity',
-    show: 'use show_in_header or hidden',
+    show: 'use show_in_header, show_in_chart or hidden',
     offset: 'not supported',
     data_generator: 'not supported (no JavaScript); list attributes can be plotted with attribute + value_key',
     smoothing: 'use line.smooth',
@@ -533,19 +534,35 @@ function normalizeSpan(cfg: Obj, ctx: Ctx): { spanMs: number; spanStart: SpanSta
   return { spanMs: Math.round(spanMs), spanStart };
 }
 
+/** Options that only affect the drawn series; ignored (with a warning) on value-only chips. */
+const CHART_ONLY_KEYS = ['type', 'line', 'fill', 'fill_opacity', 'y_axis', 'group_by', 'statistic', 'time_key', 'hidden'] as const;
+
+/** A raw series entry and its position in the YAML list (for error paths and header order). */
+interface RawSeriesEntry {
+  entry: SeriesConfig | string;
+  pos: number;
+}
+
+/**
+ * Normalizes one group of series: the drawn ones (`valueOnly` false, indices 0..n-1 so they line up
+ * with the loaded data, palette colours by that index), or the value-only header chips
+ * (`show_in_chart: false`, keys "v<i>:...").
+ */
 function normalizeSeries(
-  rawList: Array<SeriesConfig | string>,
+  rawList: RawSeriesEntry[],
   axes: NormalizedYAxis[],
   cardGroupBy: NormalizedGroupBy | null,
   dataSource: 'history' | 'statistics',
   ctx: Ctx,
   seriesKey: string,
+  valueOnly = false,
 ): NormalizedSeries[] {
   const count = rawList.length;
-  return rawList.map((entry, index) => {
-    const path = `${seriesKey}[${index}]`;
+  return rawList.map(({ entry, pos }, index) => {
+    const path = `${seriesKey}[${pos}]`;
     const s: Obj = typeof entry === 'string' ? { entity: entry } : isObj(entry) ? entry : fail(path, 'must be an entity id or { entity: ... }');
     checkKeys(s, 'series', path, ctx);
+    const showInChart = optBool(s.show_in_chart, `${path}.show_in_chart`) ?? true;
     const entity = optString(s.entity, `${path}.entity`);
     if (entity === undefined) fail(`${path}.entity`, 'is required (e.g. sensor.living_room_temperature)');
     checkEntityId(entity, `${path}.entity`);
@@ -589,7 +606,7 @@ function normalizeSeries(
       (fill === 'none' ? 0 : type === 'bar' ? DEFAULTS.barOpacity : fill === 'solid' ? DEFAULTS.solidOpacity : DEFAULTS.gradientOpacity);
 
     const groupBy = s.group_by === undefined ? cardGroupBy : normalizeGroupBy(s.group_by, `${path}.group_by`, ctx);
-    if (type === 'bar' && !groupBy && statistic === 'auto' && valueKey === undefined && !isExternalStatistic(entity) && dataSource === 'history') {
+    if (!valueOnly && type === 'bar' && !groupBy && statistic === 'auto' && valueKey === undefined && !isExternalStatistic(entity) && dataSource === 'history') {
       ctx.warnings.push(`${path}: bars of raw history have no bucket width; set group_by (e.g. 1h) or a statistic (e.g. change)`);
     }
 
@@ -597,16 +614,26 @@ function normalizeSeries(
     const tr = (s.transform ?? {}) as Obj;
     checkKeys(tr, 'transform', `${path}.transform`, ctx);
 
+    const showInHeader = optBool(s.show_in_header, `${path}.show_in_header`) ?? true;
+    if (valueOnly) {
+      if (!showInHeader) fail(`${path}.show_in_chart`, 'false shows the series only in the header, but show_in_header is false (it would show nothing)');
+      if (valueKey !== undefined) fail(`${path}.value_key`, 'cannot be combined with show_in_chart: false (list items are only drawn in the chart)');
+      if (isExternalStatistic(entity)) fail(`${path}.show_in_chart`, `false needs a live entity state; the external statistic "${entity}" has none`);
+      const ignored = CHART_ONLY_KEYS.filter((k) => s[k] !== undefined && s[k] !== null);
+      if (ignored.length) ctx.warnings.push(`${path}: ${ignored.join(', ')} ignored with show_in_chart: false (the series is not drawn)`);
+    }
+
     return {
       index,
-      key: `${index}:${entity}${attribute ? `#${attribute}` : ''}${valueKey !== undefined ? `[${valueKey}]` : ''}`,
+      key: `${valueOnly ? 'v' : ''}${index}:${entity}${attribute ? `#${attribute}` : ''}${valueKey !== undefined ? `[${valueKey}]` : ''}`,
       entity,
       attribute,
       valueKey,
       timeKey,
       type,
       name: optText(s.name, `${path}.name`),
-      color: optString(s.color, `${path}.color`) ?? DEFAULT_PALETTE[index % DEFAULT_PALETTE.length],
+      // Value-only chips are neutral unless coloured explicitly (they draw no line to match).
+      color: optString(s.color, `${path}.color`) ?? (valueOnly ? 'var(--secondary-text-color)' : DEFAULT_PALETTE[index % DEFAULT_PALETTE.length]),
       unit,
       yAxis,
       line,
@@ -620,8 +647,9 @@ function normalizeSeries(
       colorThresholds,
       statistic,
       precision: optNumber(s.precision, `${path}.precision`, { min: 0, max: 10 }),
-      showInHeader: optBool(s.show_in_header, `${path}.show_in_header`) ?? true,
-      hidden: optBool(s.hidden, `${path}.hidden`) ?? false,
+      showInHeader,
+      showInChart,
+      hidden: valueOnly ? false : (optBool(s.hidden, `${path}.hidden`) ?? false),
     };
   });
 }
@@ -645,7 +673,7 @@ function normalizeUpdate(v: unknown, ctx: Ctx): NormalizedUpdate {
   return { mode: 'interval', intervalMs };
 }
 
-function normalizeShow(v: unknown, series: NormalizedSeries[], ctx: Ctx): NormalizedShow {
+function normalizeShow(v: unknown, series: NormalizedSeries[], valueChips: number, ctx: Ctx): NormalizedShow {
   if (v !== undefined && v !== null && !isObj(v)) fail('show', 'must be an object like { legend: true }');
   const s = (v ?? {}) as Obj;
   checkKeys(s, 'show', 'show', ctx);
@@ -654,9 +682,11 @@ function normalizeShow(v: unknown, series: NormalizedSeries[], ctx: Ctx): Normal
 
   // The legend covers what the header chips cannot toggle: series without a chip, and the single
   // "hero" value (it has no toggle) whenever something needs the legend anyway or it starts hidden.
+  // Value-only chips (show_in_chart: false) count for the hero layout but toggle nothing.
   const chips = headerStates ? series.filter((x) => x.showInHeader) : [];
   let uncovered = series.filter((x) => !chips.includes(x));
-  if (chips.length === 1 && (uncovered.length > 0 || chips[0].hidden)) uncovered = series;
+  const heroOnly = chips.length === 1 && (headerStates ? valueChips : 0) === 0;
+  if (heroOnly && (uncovered.length > 0 || chips[0].hidden)) uncovered = series;
   // A lone series needs no legend unless it starts hidden (nothing else could show it).
   const autoLegend = uncovered.length > 0 && (series.length > 1 || uncovered.some((x) => x.hidden));
   const legend = explicitLegend ?? autoLegend;
@@ -763,11 +793,29 @@ export function normalizeConfig(raw: CardConfig): NormalizedConfig {
 
   const yAxes = normalizeYAxes(cfg.y_axes, ctx);
   const cardGroupBy = normalizeGroupBy(cfg.group_by, 'group_by', ctx);
-  const series = normalizeSeries(seriesRaw as Array<SeriesConfig | string>, yAxes, cardGroupBy, dataSource, ctx, seriesKey);
+  // show_in_chart: false entries become value-only header chips; split them off first so the drawn
+  // series keep contiguous indices (they line up with the loaded data) and their palette colours.
+  const entries: RawSeriesEntry[] = (seriesRaw as Array<SeriesConfig | string>).map((entry, pos) => ({ entry, pos }));
+  const isValueOnly = (e: RawSeriesEntry): boolean => isObj(e.entry) && (e.entry as Obj).show_in_chart === false;
+  const chartEntries = entries.filter((e) => !isValueOnly(e));
+  const valueEntries = entries.filter(isValueOnly);
+  if (chartEntries.length === 0) fail(seriesKey, 'needs at least one series drawn in the chart (every series has show_in_chart: false)');
+  const series = normalizeSeries(chartEntries, yAxes, cardGroupBy, dataSource, ctx, seriesKey);
+  const valueSeries = normalizeSeries(valueEntries, yAxes, cardGroupBy, dataSource, ctx, seriesKey, true);
 
   if (ds === 'history' && period !== undefined && !series.some((s) => s.statistic !== 'auto' || isExternalStatistic(s.entity))) {
     ctx.warnings.push('statistics_period is ignored with data_source: history');
   }
+
+  const update = normalizeUpdate(cfg.update, ctx);
+  const show = normalizeShow(cfg.show, series, valueSeries.length, ctx);
+  if (valueSeries.length && !show.headerStates) {
+    ctx.warnings.push('show.header_states: false hides the series with show_in_chart: false (they only appear in the header)');
+  }
+  const byPos = new Map<number, NormalizedSeries>();
+  chartEntries.forEach((e, i) => byPos.set(e.pos, series[i]));
+  valueEntries.forEach((e, i) => byPos.set(e.pos, valueSeries[i]));
+  const headerSeries = show.headerStates ? entries.map((e) => byPos.get(e.pos)!).filter((x) => x.showInHeader) : [];
 
   return {
     type: typeof cfg.type === 'string' ? cfg.type : 'custom:echart-graph-card',
@@ -778,11 +826,13 @@ export function normalizeConfig(raw: CardConfig): NormalizedConfig {
     dataSource,
     dataSourceAuto: ds === 'auto',
     statisticsPeriod: period ?? defaultStatisticsPeriod(spanMs),
-    update: normalizeUpdate(cfg.update, ctx),
-    show: normalizeShow(cfg.show, series, ctx),
+    update,
+    show,
     yAxes,
     thresholds: normalizeThresholds(cfg.thresholds, yAxes, ctx),
     series,
+    valueSeries,
+    headerSeries,
     raw,
     warnings: ctx.warnings,
   };
